@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=PortWatch
+GenericName=Port Monitor
+Comment=See which ports are listening and open the web ones in a browser
+Comment[ko]=열려 있는 포트를 한눈에 보고 웹 서버는 브라우저로 엽니다
+Exec=portwatch
+Icon=network-server
+Terminal=false
+Categories=Development;Network;Monitor;
+Keywords=port;server;listen;localhost;socket;docker;
+StartupNotify=true

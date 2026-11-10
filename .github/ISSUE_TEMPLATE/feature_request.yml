@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest something PortWatch should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you doing today that PortWatch makes harder than it should be?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like instead
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This can be done without new runtime dependencies
+        - label: This does not require running PortWatch as root

@@ -1,0 +1,25 @@
+name: Bug report
+description: Something in PortWatch does not work as described
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you see instead?
+    validations:
+      required: true
+  - type: textarea
+    id: ss
+    attributes:
+      label: Output of `ss -ltnpH`
+      description: >
+        The row PortWatch got wrong is enough. Please remove anything you do not want public.
+      render: shell
+  - type: input
+    id: env
+    attributes:
+      label: Distribution and GNOME version
+      placeholder: Ubuntu 24.04, GNOME 46
+    validations:
+      required: true

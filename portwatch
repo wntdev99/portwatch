@@ -1,0 +1,745 @@
+#!/usr/bin/env python3
+"""PortWatch — 로컬에서 LISTEN 중인 포트를 한눈에 보고 브라우저로 여는 GNOME 앱."""
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gtk, Gio, GLib, Gdk, GObject  # noqa: E402
+
+import json
+import os
+import re
+import socket
+import subprocess
+import threading
+import time
+
+APP_ID = "dev.local.PortWatch"
+REFRESH_SEC = 5
+PROBE_TIMEOUT = 0.35
+CONFIG = os.path.expanduser("~/.config/portwatch.json")
+
+SYSTEM_PORTS = {22, 53, 631, 5353, 41641, 5355}
+SYSTEM_PROCS = {"sshd", "cupsd", "systemd-resolve", "tailscaled", "avahi-daemon",
+                "jumpcloud-agent", "jumpcloud-assist-service", "rustdesk", "glances"}
+
+# 프로세스를 읽을 수 없을 때 포트 번호만으로 짐작하는 서비스 이름
+WELL_KNOWN = {
+    22: "SSH", 53: "DNS", 80: "HTTP", 443: "HTTPS", 631: "CUPS 인쇄",
+    1883: "MQTT", 3000: "개발 서버", 3306: "MySQL", 5000: "개발 서버",
+    5432: "PostgreSQL", 5433: "PostgreSQL", 5672: "RabbitMQ", 5900: "VNC",
+    6379: "Redis", 7070: "원격 관리", 8000: "개발 서버", 8080: "HTTP 대체",
+    8443: "HTTPS 대체", 9000: "개발 서버", 9090: "Prometheus", 11211: "Memcached",
+    27017: "MongoDB", 41641: "Tailscale", 61209: "Glances",
+}
+
+# ---------------------------------------------------------------- 데이터 수집
+
+_probe_cache = {}
+_probe_lock = threading.Lock()
+_name_cache = {}
+
+
+def sh(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def split_addr(endpoint):
+    if endpoint.startswith("["):
+        host, _, port = endpoint.rpartition("]:")
+        return host[1:], port
+    host, _, port = endpoint.rpartition(":")
+    return host.split("%")[0], port
+
+
+def connect_host(addr):
+    return "127.0.0.1" if addr in ("0.0.0.0", "*", "::", "") else addr
+
+
+def proc_info(pid):
+    info = {"user": "?", "cmdline": "", "cwd": "", "docker": False, "uptime": ""}
+    try:
+        info["user"] = sh(["stat", "-c", "%U", f"/proc/{pid}"]).strip() or "?"
+    except Exception:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            info["cmdline"] = fh.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except Exception:
+        pass
+    try:
+        info["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+    except Exception:
+        pass
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as fh:
+            text = fh.read()
+            info["docker"] = "docker" in text or "containerd" in text
+    except Exception:
+        pass
+    try:
+        info["uptime"] = sh(["ps", "-o", "etime=", "-p", str(pid)]).strip()
+    except Exception:
+        pass
+    return info
+
+
+_docker_names = {}
+_docker_stamp = 0.0
+
+
+def docker_names():
+    """컨테이너 ID 앞 12자리 -> 컨테이너 이름. 10초간 캐시한다."""
+    global _docker_stamp
+    now = time.time()
+    if _docker_names and now - _docker_stamp < 10:
+        return _docker_names
+    out = sh(["docker", "ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"], timeout=3)
+    if out:
+        _docker_names.clear()
+        for line in out.splitlines():
+            cid, _, name = line.partition("\t")
+            if cid and name:
+                _docker_names[cid[:12]] = name
+    _docker_stamp = now
+    return _docker_names
+
+
+def container_of(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as fh:
+            text = fh.read()
+    except Exception:
+        return None
+    m = re.search(r"([0-9a-f]{12})[0-9a-f]*", text)
+    if not m:
+        return None
+    return docker_names().get(m.group(1))
+
+
+def friendly_name(row):
+    """프로세스와 작업 디렉터리에서 사람이 읽을 이름을 뽑는다."""
+    key = (row["pid"], row["port"])
+    if key in _name_cache:
+        return _name_cache[key]
+
+    cmd, cwd, name = row["cmdline"], row["cwd"], row["name"]
+    label = row.get("container")
+
+    if cwd and os.path.isdir(cwd):
+        for pkg in ("package.json",):
+            path = os.path.join(cwd, pkg)
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        label = json.load(fh).get("name")
+                except Exception:
+                    pass
+
+    if not label:
+        m = re.search(r"--directory\s+(\S+)", cmd)
+        if m:
+            label = os.path.basename(m.group(1).rstrip("/")) or None
+
+    if not label and cwd and cwd not in ("/", os.path.expanduser("~")):
+        label = os.path.basename(cwd.rstrip("/")) or None
+
+    if not label:
+        label = name or f"포트 {row['port']}"
+
+    runtime = ""
+    if "vite" in cmd:
+        runtime = "Vite"
+    elif "uvicorn" in cmd:
+        runtime = "uvicorn"
+    elif "http.server" in cmd:
+        runtime = "http.server"
+    elif name in ("node", "bun", "python3", "deno"):
+        runtime = name
+    elif row["docker"]:
+        runtime = "Docker"
+
+    text = f"{label} · {runtime}" if runtime and runtime.lower() != label.lower() else label
+    _name_cache[key] = text
+    return text
+
+
+def probe(addr, port):
+    key = (addr, port)
+    with _probe_lock:
+        if key in _probe_cache:
+            return _probe_cache[key]
+    host = connect_host(addr)
+    kind = "tcp"
+    try:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(PROBE_TIMEOUT)
+            sock.connect((host, port))
+            sock.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            head = sock.recv(16)
+            if head.startswith(b"HTTP/"):
+                kind = "http"
+            elif head[:1] in (b"\x15", b"\x16"):
+                kind = "https"
+    except (socket.timeout, ConnectionResetError):
+        kind = "https" if port in (443, 8443) else "tcp"
+    except Exception:
+        kind = "tcp"
+    with _probe_lock:
+        _probe_cache[key] = kind
+    return kind
+
+
+def merge_dual_stack(rows):
+    groups = {}
+    for row in rows:
+        groups.setdefault((row["port"], row["pid"], row["name"]), []).append(row)
+    merged = []
+    for group in groups.values():
+        base = dict(group[0])
+        addrs = sorted({r["addr"] for r in group})
+        wildcard = [a for a in addrs if a in ("0.0.0.0", "::", "*")]
+        base["addr"] = wildcard[0] if wildcard else addrs[0]
+        base["addrs"] = ", ".join(addrs)
+        base["public"] = bool(wildcard) or any(
+            not a.startswith("127.") and a not in ("::1",) for a in addrs)
+        merged.append(base)
+    return sorted(merged, key=lambda r: (r["port"], r["addr"]))
+
+
+DEMO_ROWS = [
+    # (포트, 바인드, 프로세스, 제목, 명령줄, 작업 디렉터리, 종류, docker, 가동시간)
+    (3000, "127.0.0.1", "node", "storefront · Next.js",
+     "node node_modules/.bin/next dev --port 3000", "~/work/storefront", "http", False, "02:41:08"),
+    (5173, "127.0.0.1", "node", "admin-console · Vite",
+     "node node_modules/.bin/vite --host 127.0.0.1 --port 5173", "~/work/admin-console", "http", False, "01:12:55"),
+    (8000, "0.0.0.0", "python3", "billing-api · uvicorn",
+     "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload", "~/work/billing-api", "http", False, "03:27:19"),
+    (6006, "127.0.0.1", "node", "design-system · Storybook",
+     "node node_modules/.bin/storybook dev -p 6006", "~/work/design-system", "http", False, "00:48:02"),
+    (5432, "127.0.0.1", "postgres", "pg-main · Docker",
+     "postgres -c config_file=/etc/postgresql/postgresql.conf", "/var/lib/postgresql", "tcp", True, "11:04:33"),
+    (6379, "0.0.0.0", "redis-server", "cache · Docker",
+     "redis-server *:6379", "/data", "tcp", True, "11:04:33"),
+    (9090, "127.0.0.1", "prometheus", "prometheus · Docker",
+     "/bin/prometheus --config.file=/etc/prometheus/prometheus.yml", "/prometheus", "http", True, "11:04:30"),
+    (22, "0.0.0.0", "sshd", "SSH (추정)", "", "", "tcp", False, ""),
+    (631, "127.0.0.1", "cupsd", "CUPS 인쇄 (추정)", "", "", "http", False, ""),
+]
+
+
+def demo_rows():
+    """README 스크린샷과 UI 점검용 가상 데이터."""
+    rows = []
+    for port, addr, name, title, cmd, cwd, kind, docker, uptime in DEMO_ROWS:
+        row = {
+            "port": port, "addr": addr, "addrs": addr, "name": name, "pid": 1000 + port,
+            "user": "demo", "cmdline": cmd, "cwd": cwd, "docker": docker,
+            "uptime": uptime, "restricted": not cmd, "container": None,
+            "kind": kind, "title": title,
+            "public": addr in ("0.0.0.0", "::"),
+        }
+        row["section"] = classify(row)
+        rows.append(row)
+    return rows
+
+
+def collect():
+    if os.environ.get("PORTWATCH_DEMO"):
+        return demo_rows()
+    rows = {}
+    for line in sh(["ss", "-ltnpH"]).splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        addr, port = split_addr(parts[3])
+        if not port.isdigit():
+            continue
+        m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+        name, pid = (m.group(1), int(m.group(2))) if m else ("", 0)
+        key = (addr, int(port))
+        if key in rows and not name:
+            continue
+        rows[key] = {"addr": addr, "port": int(port), "name": name, "pid": pid}
+
+    for row in rows.values():
+        if row["pid"]:
+            row.update(proc_info(row["pid"]))
+            row["container"] = container_of(row["pid"]) if row["docker"] else None
+        else:
+            row.update({"user": "root", "cmdline": "", "cwd": "", "container": None,
+                        "docker": False, "uptime": "", "restricted": True})
+            row.setdefault("name", "")
+        row.setdefault("restricted", False)
+
+    merged = merge_dual_stack(rows.values())
+    for row in merged:
+        row["kind"] = probe(row["addr"], row["port"])
+        if row["restricted"]:
+            guess = WELL_KNOWN.get(row["port"])
+            row["title"] = f"{guess} (추정)" if guess else f"포트 {row['port']}"
+        else:
+            row["title"] = friendly_name(row)
+        row["section"] = classify(row)
+    return merged
+
+
+def classify(row):
+    if row["restricted"] or row["name"] in SYSTEM_PROCS or row["port"] in SYSTEM_PORTS:
+        return "system"
+    if row["docker"]:
+        return "docker"
+    return "mine"
+
+
+def url_for(row):
+    scheme = {"http": "http", "https": "https"}.get(row.get("kind", "tcp"), "http")
+    if row["port"] in (443, 8443) and scheme == "http":
+        scheme = "https"
+    host = connect_host(row["addr"])
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{row['port']}/"
+
+
+# ---------------------------------------------------------------- 설정 저장
+
+def load_config():
+    try:
+        with open(CONFIG, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 스타일
+
+CSS = b"""
+.port-pill {
+  font-family: monospace;
+  font-weight: 800;
+  font-size: 1.05em;
+  min-width: 58px;
+  padding: 6px 2px;
+  border-radius: 9px;
+  background: alpha(currentColor, 0.10);
+}
+.port-http   { color: #3584e4; }
+.port-https  { color: #2ec27e; }
+.port-tcp    { color: #9a9996; }
+.badge-http  { color: #3584e4; }
+.badge-https { color: #2ec27e; }
+.badge {
+  font-size: 0.76em;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: alpha(currentColor, 0.14);
+}
+.badge-public { color: #e5a50a; }
+.badge-docker { color: #3584e4; }
+.row-sub { font-family: monospace; font-size: 0.84em; opacity: 0.72; }
+.star-on { color: @warning_color; }
+"""
+
+
+# ---------------------------------------------------------------- 창
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="PortWatch")
+        self.set_default_size(960, 720)
+
+        self.cfg = load_config()
+        self.pinned = set(self.cfg.get("pinned", []))
+        self.show_system = self.cfg.get("show_system", False)
+        self.auto = self.cfg.get("auto_refresh", True)
+        self.rows = []
+        self.query = ""
+        self.signature = None
+        self.timer = None
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.toasts.set_child(root)
+
+        # --- 헤더바
+        header = Adw.HeaderBar()
+        self.title_widget = Adw.WindowTitle(title="PortWatch", subtitle="로컬 LISTEN 포트")
+        header.set_title_widget(self.title_widget)
+
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="새로고침 (Ctrl+R)")
+        refresh.connect("clicked", lambda *_: self.reload())
+        header.pack_start(refresh)
+
+        self.search_btn = Gtk.ToggleButton(icon_name="system-search-symbolic",
+                                           tooltip_text="검색 (Ctrl+F)")
+        header.pack_end(self.search_btn)
+
+        menu = Gio.Menu()
+        view = Gio.Menu()
+        view.append("시스템·관리 포트 표시", "win.show-system")
+        view.append("자동 갱신 (5초)", "win.auto-refresh")
+        menu.append_section("보기", view)
+        other = Gio.Menu()
+        other.append("키보드 단축키", "win.shortcuts")
+        other.append("PortWatch 정보", "win.about")
+        menu.append_section(None, other)
+        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                                  tooltip_text="메뉴")
+        header.pack_end(menu_btn)
+        root.append(header)
+
+        # --- 검색 바
+        self.search_entry = Gtk.SearchEntry(placeholder_text="포트, 이름, 명령줄로 검색")
+        self.search_entry.connect("search-changed", self.on_search)
+        self.search_bar = Gtk.SearchBar(child=self.search_entry)
+        self.search_bar.set_key_capture_widget(self)
+        self.search_btn.bind_property(
+            "active", self.search_bar, "search-mode-enabled",
+            GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
+        root.append(self.search_bar)
+
+        # --- 본문
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               vexpand=True)
+        self.page = Adw.PreferencesPage()
+        scroller = Gtk.ScrolledWindow(child=self.page, vexpand=True)
+        self.stack.add_named(scroller, "list")
+
+        self.empty = Adw.StatusPage(icon_name="system-search-symbolic",
+                                    title="결과 없음",
+                                    description="검색어와 일치하는 포트가 없습니다.")
+        self.stack.add_named(self.empty, "empty")
+
+        self.loading = Adw.StatusPage(title="포트를 살펴보는 중…")
+        spinner = Gtk.Spinner(spinning=True, width_request=36, height_request=36)
+        self.loading.set_child(spinner)
+        self.stack.add_named(self.loading, "loading")
+        self.stack.set_visible_child_name("loading")
+        root.append(self.stack)
+
+        # --- 액션과 단축키
+        self.add_toggle_action("show-system", self.show_system, self.on_show_system)
+        self.add_toggle_action("auto-refresh", self.auto, self.on_auto)
+        self.add_simple_action("shortcuts", self.on_shortcuts)
+        self.add_simple_action("about", self.on_about)
+
+        app.set_accels_for_action("win.refresh", ["<Control>r"])
+        self.add_simple_action("refresh", lambda *_: self.reload())
+        app.set_accels_for_action("win.find", ["<Control>f"])
+        self.add_simple_action("find", lambda *_: self.search_btn.set_active(True))
+
+        self.reload()
+        self.sync_timer()
+
+    # ---------- 액션 도우미
+    def add_simple_action(self, name, callback):
+        act = Gio.SimpleAction.new(name, None)
+        act.connect("activate", callback)
+        self.add_action(act)
+
+    def add_toggle_action(self, name, state, callback):
+        act = Gio.SimpleAction.new_stateful(name, None, GLib.Variant.new_boolean(state))
+        act.connect("change-state", callback)
+        self.add_action(act)
+
+    # ---------- 갱신 주기
+    def sync_timer(self):
+        if self.auto and self.timer is None:
+            self.timer = GLib.timeout_add_seconds(REFRESH_SEC, self.on_tick)
+        elif not self.auto and self.timer is not None:
+            GLib.source_remove(self.timer)
+            self.timer = None
+
+    def on_tick(self):
+        self.reload()
+        return True
+
+    def on_auto(self, action, value):
+        action.set_state(value)
+        self.auto = value.get_boolean()
+        self.cfg["auto_refresh"] = self.auto
+        save_config(self.cfg)
+        self.sync_timer()
+
+    def on_show_system(self, action, value):
+        action.set_state(value)
+        self.show_system = value.get_boolean()
+        self.cfg["show_system"] = self.show_system
+        save_config(self.cfg)
+        self.render()
+
+    def on_search(self, entry):
+        self.query = entry.get_text().strip().lower()
+        self.render()
+
+    # ---------- 데이터
+    def reload(self):
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        rows = collect()
+        GLib.idle_add(self._apply, rows)
+
+    def _apply(self, rows):
+        self.rows = rows
+        self.render()
+        return False
+
+    # ---------- 화면 구성
+    def visible_rows(self):
+        out = []
+        for row in self.rows:
+            if row["section"] == "system" and not self.show_system:
+                continue
+            if self.query:
+                haystack = " ".join([
+                    str(row["port"]), row["title"], row["name"], row["cmdline"],
+                    row["cwd"], row["addrs"],
+                ]).lower()
+                if self.query not in haystack:
+                    continue
+            out.append(row)
+        return out
+
+    def render(self):
+        rows = self.visible_rows()
+        signature = json.dumps(
+            [[r["port"], r["pid"], r["kind"], r["section"], r["title"],
+              r["port"] in self.pinned] for r in rows], sort_keys=True)
+        counts = (len([r for r in self.rows if r["section"] == "mine"]),
+                  len([r for r in self.rows if r["section"] == "docker"]),
+                  len(self.rows))
+        self.title_widget.set_subtitle(
+            f"내 서버 {counts[0]} · Docker {counts[1]} · 전체 {counts[2]}")
+
+        if signature == self.signature:
+            return
+        self.signature = signature
+
+        child = self.page.get_first_child()
+        while child is not None:
+            self.page.remove(child) if isinstance(child, Adw.PreferencesGroup) else None
+            child = self.page.get_first_child() if isinstance(child, Adw.PreferencesGroup) else None
+        # PreferencesPage는 내부 컨테이너를 쓰므로 안전하게 새로 만든다.
+        new_page = Adw.PreferencesPage()
+        scroller = self.stack.get_child_by_name("list")
+        scroller.set_child(new_page)
+        self.page = new_page
+
+        if not rows:
+            self.stack.set_visible_child_name("empty")
+            self.empty.set_title("표시할 포트가 없습니다" if not self.query else "결과 없음")
+            self.empty.set_description(
+                "검색어와 일치하는 포트가 없습니다." if self.query else
+                "메뉴에서 '시스템·관리 포트 표시'를 켜 보세요.")
+            return
+        self.stack.set_visible_child_name("list")
+
+        sections = [
+            ("pinned", "즐겨찾기", "자주 여는 포트입니다."),
+            ("mine", "내 서버", "직접 띄운 프로세스입니다."),
+            ("docker", "Docker 컨테이너", "컨테이너 안에서 도는 서비스입니다."),
+            ("system", "시스템·관리 도구", "OS와 IT 관리 도구가 쓰는 포트입니다."),
+        ]
+        buckets = {key: [] for key, _, _ in sections}
+        for row in rows:
+            bucket = "pinned" if row["port"] in self.pinned else row["section"]
+            buckets[bucket].append(row)
+
+        for key, title, subtitle in sections:
+            items = buckets[key]
+            if not items:
+                continue
+            group = Adw.PreferencesGroup(title=f"{title}  ({len(items)})",
+                                         description=subtitle)
+            for row in items:
+                group.add(self.build_row(row))
+            self.page.add(group)
+
+    def build_row(self, row):
+        web = row["kind"] in ("http", "https")
+        action_row = Adw.ActionRow(
+            title=GLib.markup_escape_text(row["title"]),
+            subtitle=GLib.markup_escape_text(self.subtitle_for(row)),
+            activatable=web,
+        )
+        action_row.set_subtitle_lines(2)
+        if web:
+            action_row.connect("activated", lambda *_: self.open_row(row))
+            action_row.set_tooltip_text(f"클릭하면 {url_for(row)} 를 엽니다")
+        else:
+            action_row.set_tooltip_text("웹 서버가 아니므로 브라우저로 열 수 없습니다")
+
+        pill = Gtk.Label(label=str(row["port"]), valign=Gtk.Align.CENTER)
+        pill.add_css_class("port-pill")
+        pill.add_css_class({"http": "port-http", "https": "port-https"}.get(row["kind"], "port-tcp"))
+        action_row.add_prefix(pill)
+
+        badges = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        if row["kind"] != "tcp":
+            badges.append(self.badge(row["kind"].upper(), f"badge-{row['kind']}"))
+        if row["docker"]:
+            badges.append(self.badge("Docker", "badge-docker"))
+        if row["public"]:
+            badge = self.badge("외부 공개", "badge-public")
+            badge.set_tooltip_text(f"{row['addrs']} 에 바인딩되어 같은 네트워크의 다른 장비에서 접근됩니다")
+            badges.append(badge)
+        action_row.add_suffix(badges)
+
+        star = Gtk.Button(icon_name="starred-symbolic" if row["port"] in self.pinned
+                          else "non-starred-symbolic",
+                          valign=Gtk.Align.CENTER, has_frame=False,
+                          tooltip_text="즐겨찾기")
+        if row["port"] in self.pinned:
+            star.add_css_class("star-on")
+        star.connect("clicked", lambda *_: self.toggle_pin(row))
+        action_row.add_suffix(star)
+
+        if web:
+            open_btn = Gtk.Button(icon_name="external-link-symbolic",
+                                  valign=Gtk.Align.CENTER, has_frame=False,
+                                  tooltip_text="브라우저로 열기")
+            open_btn.connect("clicked", lambda *_: self.open_row(row))
+            action_row.add_suffix(open_btn)
+
+        menu = Gio.Menu()
+        if web:
+            menu.append("브라우저로 열기", f"win.open-{row['port']}")
+            menu.append("URL 복사", f"win.copy-url-{row['port']}")
+        menu.append("명령줄 복사", f"win.copy-cmd-{row['port']}")
+        if row["cwd"]:
+            menu.append("작업 디렉터리 열기", f"win.open-dir-{row['port']}")
+        self.register_row_actions(row, web)
+        more = Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=menu,
+                              valign=Gtk.Align.CENTER, has_frame=False,
+                              tooltip_text="더 보기")
+        action_row.add_suffix(more)
+        return action_row
+
+    def register_row_actions(self, row, web):
+        port = row["port"]
+        defs = [
+            (f"copy-cmd-{port}", lambda *_: self.copy(row["cmdline"] or "-", "명령줄을 복사했습니다")),
+        ]
+        if web:
+            defs += [
+                (f"open-{port}", lambda *_: self.open_row(row)),
+                (f"copy-url-{port}", lambda *_: self.copy(url_for(row), "URL을 복사했습니다")),
+            ]
+        if row["cwd"]:
+            defs.append((f"open-dir-{port}", lambda *_: self.open_path(row["cwd"])))
+        for name, callback in defs:
+            if self.lookup_action(name) is None:
+                self.add_simple_action(name, callback)
+
+    @staticmethod
+    def badge(text, css):
+        label = Gtk.Label(label=text, valign=Gtk.Align.CENTER)
+        label.add_css_class("badge")
+        if css != "badge":
+            label.add_css_class(css)
+        return label
+
+    @staticmethod
+    def subtitle_for(row):
+        bits = []
+        if row["restricted"]:
+            bits.append("root 소유 · 프로세스 정보 없음")
+        else:
+            if row["cmdline"]:
+                bits.append(row["cmdline"][:150])
+            if row["uptime"]:
+                bits.append(f"가동 {row['uptime']}")
+        bits.append(row["addrs"])
+        return "   ·   ".join(bits)
+
+    # ---------- 동작
+    def open_row(self, row):
+        Gio.AppInfo.launch_default_for_uri(url_for(row), None)
+        self.toast(f"{row['title']} 을(를) 브라우저에서 열었습니다")
+
+    def open_path(self, path):
+        Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(path, None), None)
+
+    def copy(self, text, message):
+        self.get_clipboard().set(text)
+        self.toast(message)
+
+    def toggle_pin(self, row):
+        port = row["port"]
+        self.pinned.symmetric_difference_update({port})
+        self.cfg["pinned"] = sorted(self.pinned)
+        save_config(self.cfg)
+        self.signature = None
+        self.render()
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=2))
+
+    def on_shortcuts(self, *_):
+        dialog = Adw.MessageDialog(
+            transient_for=self, heading="키보드 단축키",
+            body="Ctrl + R        새로고침\n"
+                 "Ctrl + F        검색\n"
+                 "Esc             검색 닫기\n"
+                 "Enter           선택한 서버를 브라우저로 열기\n"
+                 "Ctrl + W        창 닫기")
+        dialog.add_response("ok", "닫기")
+        dialog.present()
+
+    def on_about(self, *_):
+        about = Adw.AboutWindow(
+            transient_for=self, application_name="PortWatch",
+            application_icon="network-server", version="2.0",
+            comments="로컬에서 LISTEN 중인 TCP 포트를 모아 보여주고, "
+                     "웹 서버는 클릭 한 번으로 브라우저에서 엽니다.",
+            developer_name="로컬 도구")
+        about.present()
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.set_accels_for_action("window.close", ["<Control>w"])
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        scheme = os.environ.get("PORTWATCH_COLOR_SCHEME") or sh(
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"]).strip()
+        manager = Adw.StyleManager.get_default()
+        if "prefer-dark" in scheme:
+            manager.set_color_scheme(Adw.ColorScheme.PREFER_DARK)
+        elif "prefer-light" in scheme:
+            manager.set_color_scheme(Adw.ColorScheme.PREFER_LIGHT)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    App().run(None)

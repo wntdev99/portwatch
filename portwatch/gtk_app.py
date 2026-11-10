@@ -10,10 +10,12 @@ from gi.repository import Adw, Gtk, Gio, GLib, Gdk, GObject  # noqa: E402
 
 import json
 import os
+import threading
 
 from .core import actions
+from .core.platform import run as run_cmd
 from .core import config as config_mod
-from .core.collect import collect, can_kill, CURRENT_USER, RISKY_PORTS
+from .core.collect import collect, can_kill, RISKY_PORTS
 from .core.probe import url_for
 
 APP_ID = "dev.local.PortWatch"
@@ -776,7 +778,7 @@ class App(Adw.Application):
 
     def do_startup(self):
         Adw.Application.do_startup(self)
-        scheme = os.environ.get("PORTWATCH_COLOR_SCHEME") or sh(
+        scheme = os.environ.get("PORTWATCH_COLOR_SCHEME") or run_cmd(
             ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"]).strip()
         manager = Adw.StyleManager.get_default()
         if "prefer-dark" in scheme:

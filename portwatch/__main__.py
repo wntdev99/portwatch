@@ -6,6 +6,15 @@ from . import __version__
 from .core import platform as plat
 
 
+def _utf8_console():
+    """Windows 기본 콘솔 인코딩(cp1252)에서 한글 출력이 죽지 않게 한다."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def gtk_available():
     try:
         import gi
@@ -30,6 +39,7 @@ def main(argv=None):
                         help="웹 화면을 띄우되 브라우저를 자동으로 열지 않습니다")
     parser.add_argument("--version", action="version", version=f"PortWatch {__version__}")
     args = parser.parse_args(argv)
+    _utf8_console()
 
     use_gtk = args.gtk or (not args.web and plat.IS_LINUX and gtk_available())
     if use_gtk:

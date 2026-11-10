@@ -1,5 +1,5 @@
 """README 스크린샷과 UI 점검에 쓰는 가상 데이터."""
-from .collect import classify, can_kill
+from .collect import classify
 
 DEMO_ROWS = [
     (3000, "127.0.0.1", "node", "storefront · Next.js",

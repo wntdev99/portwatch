@@ -43,6 +43,15 @@ def run(cmd, timeout=5):
         return ""
 
 
+def run_full(cmd, timeout=5):
+    """진단용. (종료 코드, stdout, stderr)"""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+    except Exception as exc:
+        return -1, "", str(exc)
+
+
 def split_addr(endpoint):
     """'0.0.0.0:8080', '[::]:22', '127.0.0.1:5432' -> (주소, 포트)"""
     if endpoint.startswith("["):
@@ -134,6 +143,31 @@ def _listeners_lsof():
     return list(rows.values()) or _listeners_lsof_plain()
 
 
+def _listeners_netstat():
+    """마지막 수단. 포트는 확실히 얻지만 프로세스는 알 수 없다.
+
+    macOS 에서 psutil 이 권한으로 막히고 lsof 까지 조용히 빈 결과를 줄 때,
+    적어도 '무엇이 열려 있는지' 는 보여 줄 수 있어야 한다.
+    """
+    rows = {}
+    out = run(["netstat", "-an", "-p", "tcp"])
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or parts[-1] != "LISTEN" or not parts[0].startswith("tcp"):
+            continue
+        local = parts[3]
+        addr, _, port = local.rpartition(".")      # macOS 는 127.0.0.1.7896 형식
+        if not port.isdigit():
+            addr, _, port = local.rpartition(":")
+        addr = addr.strip("[]")
+        if addr in ("*", ""):
+            addr = "0.0.0.0"
+        if port.isdigit():
+            rows[(addr, int(port))] = {"addr": addr, "port": int(port),
+                                       "name": "", "pid": 0}
+    return list(rows.values())
+
+
 def listeners():
     """LISTEN 중인 TCP 소켓 목록. [{addr, port, name, pid}, ...]"""
     if IS_LINUX:
@@ -150,7 +184,7 @@ def listeners():
         if rows or not IS_MAC:
             return rows
     if IS_MAC:
-        return _listeners_lsof()
+        return _listeners_lsof() or _listeners_netstat()
     raise Unsupported(
         "이 환경에서 포트를 읽으려면 psutil 이 필요합니다: pip install psutil")
 

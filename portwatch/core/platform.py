@@ -116,9 +116,12 @@ def listeners():
         return _listeners_psutil()
     if psutil:
         try:
-            return _listeners_psutil()
+            rows = _listeners_psutil()
         except psutil.AccessDenied:
-            pass            # macOS 에서 권한이 없으면 lsof 로 물러난다
+            rows = []       # macOS 는 root 가 아니면 거부한다
+        # macOS 에서는 거부가 예외 대신 빈 목록으로 오기도 하므로 결과까지 본다.
+        if rows or not IS_MAC:
+            return rows
     if IS_MAC:
         return _listeners_lsof()
     raise Unsupported(

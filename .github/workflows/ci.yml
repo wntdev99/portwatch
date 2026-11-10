@@ -29,6 +29,23 @@ jobs:
       - name: Collect real listeners
         run: python -c "from portwatch.core import collect; rows = collect(); print(len(rows), 'rows'); [print(' ', r['port'], r['title'], r['kind']) for r in rows[:5]]"
 
+      - name: A listener we start is actually found
+        shell: bash
+        run: |
+          python -m http.server 7897 --bind 127.0.0.1 &
+          sleep 3
+          python -c "
+          from portwatch.core import collect
+          rows = collect()
+          hit = [r for r in rows if r['port'] == 7897]
+          print('rows:', len(rows), '| 7897 found:', bool(hit))
+          assert hit, 'the listener we just started was not found'
+          row = hit[0]
+          print('  title:', row['title'], '| kind:', row['kind'], '| can_kill:', row['can_kill'])
+          assert row['kind'] == 'http', row
+          assert row['can_kill'], 'we own it, so it must be terminable'
+          "
+
       - name: Demo data renders
         env:
           PORTWATCH_DEMO: "1"

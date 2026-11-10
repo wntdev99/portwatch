@@ -29,6 +29,35 @@ jobs:
       - name: Collect real listeners
         run: python -c "from portwatch.core import collect; rows = collect(); print(len(rows), 'rows'); [print(' ', r['port'], r['title'], r['kind']) for r in rows[:5]]"
 
+      - name: Diagnose the socket source (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          python -m http.server 7896 --bind 127.0.0.1 &
+          sleep 2
+          echo "--- lsof -F pcn ---"
+          lsof -nP -iTCP -sTCP:LISTEN -F pcn | head -20 || echo "(lsof -F failed: $?)"
+          echo "--- lsof plain ---"
+          lsof -nP -iTCP -sTCP:LISTEN | head -10 || echo "(lsof failed: $?)"
+          echo "--- psutil ---"
+          python -c "
+          import psutil
+          try:
+              conns = psutil.net_connections(kind='inet')
+              listen = [c for c in conns if c.status == psutil.CONN_LISTEN]
+              print('psutil total:', len(conns), 'listen:', len(listen))
+          except Exception as exc:
+              print('psutil raised:', type(exc).__name__, exc)
+          "
+          echo "--- portwatch layers ---"
+          python -c "
+          from portwatch.core import platform as p
+          print('psutil rows:', len(p._listeners_psutil()) if p.psutil else 'no psutil')
+          print('lsof -F rows:', len(p._listeners_lsof()))
+          print('lsof plain rows:', len(p._listeners_lsof_plain()))
+          print('listeners():', len(p.listeners()))
+          "
+
       - name: A listener we start is actually found
         shell: bash
         run: |

@@ -22,9 +22,16 @@ class Unsupported(Exception):
     """이 환경에서는 포트 목록을 읽을 방법이 없다."""
 
 
+def normalise_user(name):
+    """'DOMAIN\\user' 나 대소문자 차이를 없애 비교할 수 있게 만든다."""
+    if not name:
+        return ""
+    return name.replace("/", "\\").split("\\")[-1].casefold()
+
+
 def current_user():
     if IS_WINDOWS:
-        return os.environ.get("USERNAME", "?")
+        return normalise_user(os.environ.get("USERNAME", "")) or "?"
     import pwd
     return pwd.getpwuid(os.getuid()).pw_name
 
@@ -84,6 +91,26 @@ def _listeners_psutil():
     return list(rows.values())
 
 
+def _listeners_lsof_plain():
+    """lsof 평문 출력 파싱. 'python3 1234 me 5u IPv4 ... TCP 127.0.0.1:7897 (LISTEN)'"""
+    rows = {}
+    for line in run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        name, pid = parts[0], parts[1]
+        endpoint = next((p for p in reversed(parts) if ":" in p), "")
+        addr, _, port = endpoint.rpartition(":")
+        addr = addr.strip("[]")
+        if addr in ("*", ""):
+            addr = "0.0.0.0"
+        if port.isdigit():
+            rows[(addr, int(port))] = {
+                "addr": addr, "port": int(port), "name": name,
+                "pid": int(pid) if pid.isdigit() else 0}
+    return list(rows.values())
+
+
 def _listeners_lsof():
     """macOS 에서 psutil 없이 쓰는 길. 자기 소유 프로세스만 보인다."""
     rows = {}
@@ -104,7 +131,7 @@ def _listeners_lsof():
                 rows[(addr, int(port))] = {
                     "addr": addr, "port": int(port), "name": name,
                     "pid": int(pid) if pid.isdigit() else 0}
-    return list(rows.values())
+    return list(rows.values()) or _listeners_lsof_plain()
 
 
 def listeners():
@@ -161,11 +188,14 @@ def _proc_psutil(pid):
         proc = psutil.Process(pid)
     except Exception:
         return info
-    for field, getter in (("user", proc.username), ("cwd", proc.cwd)):
-        try:
-            info[field] = getter()
-        except Exception:
-            pass
+    try:
+        info["user"] = normalise_user(proc.username()) if IS_WINDOWS else proc.username()
+    except Exception:
+        pass
+    try:
+        info["cwd"] = proc.cwd()
+    except Exception:
+        pass
     try:
         info["cmdline"] = " ".join(proc.cmdline())
     except Exception:

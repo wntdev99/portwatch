@@ -10,6 +10,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -22,6 +23,14 @@ PROBE_TIMEOUT = 0.35
 CONFIG = os.path.expanduser("~/.config/portwatch.json")
 CURRENT_USER = pwd.getpwuid(os.getuid()).pw_name
 KILL_GRACE_SEC = 3
+HEALTH_TIMEOUT = 1.0
+
+# 인증 없이 외부에 열려 있으면 특히 위험한 포트
+RISKY_PORTS = {
+    6379: "Redis", 5432: "PostgreSQL", 3306: "MySQL", 27017: "MongoDB",
+    11211: "Memcached", 9200: "Elasticsearch", 5672: "RabbitMQ",
+    2375: "Docker API", 9000: "관리 콘솔", 8086: "InfluxDB",
+}
 
 SYSTEM_PORTS = {22, 53, 631, 5353, 41641, 5355}
 SYSTEM_PROCS = {"sshd", "cupsd", "systemd-resolve", "tailscaled", "avahi-daemon",
@@ -124,6 +133,17 @@ def container_of(pid):
     return docker_names().get(m.group(1))
 
 
+def ssh_tunnel(cmd):
+    """ssh -L 포워딩 명령에서 '내 포트 -> 원격' 설명을 만든다."""
+    m = re.search(r"-L\s*(?:(\S+?):)?(\d+):(\S+?):(\d+)", cmd)
+    if not m:
+        return None
+    _, local, host, remote = m.groups()
+    target = re.search(r"(?:^|\s)([\w.-]+@[\w.-]+|[\w.-]+)\s*$", cmd.strip())
+    via = f" ({target.group(1)} 경유)" if target else ""
+    return f"{local} → {host}:{remote}{via}"
+
+
 def friendly_name(row):
     """프로세스와 작업 디렉터리에서 사람이 읽을 이름을 뽑는다."""
     key = (row["pid"], row["port"])
@@ -153,6 +173,11 @@ def friendly_name(row):
 
     if not label:
         label = name or f"포트 {row['port']}"
+
+    tunnel = ssh_tunnel(cmd) if name == "ssh" else None
+    if tunnel:
+        _name_cache[key] = f"SSH 터널 · {tunnel}"
+        return _name_cache[key]
 
     runtime = ""
     if "vite" in cmd:
@@ -196,6 +221,25 @@ def probe(addr, port):
     with _probe_lock:
         _probe_cache[key] = kind
     return kind
+
+
+def health_check(row):
+    """HTTP 행의 상태 코드와 응답 시간을 잰다. 실패하면 None을 돌려준다."""
+    host = connect_host(row["addr"])
+    try:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        start = time.monotonic()
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(HEALTH_TIMEOUT)
+            sock.connect((host, row["port"]))
+            sock.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n"
+                         b"User-Agent: PortWatch\r\nConnection: close\r\n\r\n")
+            head = sock.recv(64)
+        elapsed = int((time.monotonic() - start) * 1000)
+        m = re.match(rb"HTTP/\d\.\d (\d{3})", head)
+        return (int(m.group(1)), elapsed) if m else None
+    except Exception:
+        return None
 
 
 def merge_dual_stack(rows):
@@ -244,7 +288,7 @@ def demo_rows():
             "port": port, "addr": addr, "addrs": addr, "name": name, "pid": 1000 + port,
             "user": "demo", "cmdline": cmd, "cwd": cwd, "docker": docker,
             "uptime": uptime, "restricted": not cmd, "container": None,
-            "kind": kind, "title": title,
+            "kind": kind, "title": title, "health": (200, 3) if kind == "http" else None,
             "public": addr in ("0.0.0.0", "::"),
         }
         row["section"] = classify(row)
@@ -252,7 +296,7 @@ def demo_rows():
     return rows
 
 
-def collect():
+def collect(check_health=False):
     if os.environ.get("PORTWATCH_DEMO"):
         return demo_rows()
     rows = {}
@@ -283,6 +327,8 @@ def collect():
     merged = merge_dual_stack(rows.values())
     for row in merged:
         row["kind"] = probe(row["addr"], row["port"])
+        row["health"] = (health_check(row)
+                         if check_health and row["kind"] == "http" else None)
         if row["restricted"]:
             guess = WELL_KNOWN.get(row["port"])
             row["title"] = f"{guess} (추정)" if guess else f"포트 {row['port']}"
@@ -371,6 +417,11 @@ class Window(Adw.ApplicationWindow):
         self.pinned = set(self.cfg.get("pinned", []))
         self.show_system = self.cfg.get("show_system", False)
         self.auto = self.cfg.get("auto_refresh", True)
+        self.check_health = self.cfg.get("check_health", False)
+        self.notify = self.cfg.get("notify_changes", True)
+        # 즐겨찾기한 포트를 다시 띄우기 위해 명령과 작업 디렉터리를 기억한다.
+        self.commands = self.cfg.get("commands", {})
+        self.known = None
         self.rows = []
         self.query = ""
         self.signature = None
@@ -396,9 +447,15 @@ class Window(Adw.ApplicationWindow):
         header.pack_end(self.search_btn)
 
         menu = Gio.Menu()
+        tools = Gio.Menu()
+        tools.append("포트 비우기…", "win.free-port")
+        tools.append("외부 노출 점검…", "win.exposure")
+        menu.append_section("도구", tools)
         view = Gio.Menu()
         view.append("시스템·관리 포트 표시", "win.show-system")
         view.append("자동 갱신 (5초)", "win.auto-refresh")
+        view.append("HTTP 상태 점검", "win.check-health")
+        view.append("포트 변화 알리기", "win.notify-changes")
         menu.append_section("보기", view)
         other = Gio.Menu()
         other.append("키보드 단축키", "win.shortcuts")
@@ -441,6 +498,10 @@ class Window(Adw.ApplicationWindow):
         # --- 액션과 단축키
         self.add_toggle_action("show-system", self.show_system, self.on_show_system)
         self.add_toggle_action("auto-refresh", self.auto, self.on_auto)
+        self.add_toggle_action("check-health", self.check_health, self.on_check_health)
+        self.add_toggle_action("notify-changes", self.notify, self.on_notify)
+        self.add_simple_action("free-port", self.on_free_port)
+        self.add_simple_action("exposure", self.on_exposure)
         self.add_simple_action("shortcuts", self.on_shortcuts)
         self.add_simple_action("about", self.on_about)
 
@@ -489,6 +550,19 @@ class Window(Adw.ApplicationWindow):
         save_config(self.cfg)
         self.render()
 
+    def on_check_health(self, action, value):
+        action.set_state(value)
+        self.check_health = value.get_boolean()
+        self.cfg["check_health"] = self.check_health
+        save_config(self.cfg)
+        self.force_reload()
+
+    def on_notify(self, action, value):
+        action.set_state(value)
+        self.notify = value.get_boolean()
+        self.cfg["notify_changes"] = self.notify
+        save_config(self.cfg)
+
     def on_search(self, entry):
         self.query = entry.get_text().strip().lower()
         self.render()
@@ -498,13 +572,42 @@ class Window(Adw.ApplicationWindow):
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
-        rows = collect()
+        rows = collect(self.check_health)
         GLib.idle_add(self._apply, rows)
 
     def _apply(self, rows):
+        self.detect_changes(rows)
         self.rows = rows
         self.render()
         return False
+
+    def detect_changes(self, rows):
+        """갱신 사이에 열리거나 닫힌 포트를 찾아 알린다."""
+        current = {r["port"]: r for r in rows}
+        if self.known is None:          # 첫 수집은 기준점일 뿐이므로 알리지 않는다
+            self.known = current
+            return
+        opened = [p for p in current if p not in self.known]
+        closed = [p for p in self.known if p not in current]
+        self.known = current
+        if not self.notify or not (opened or closed):
+            return
+
+        parts = []
+        if opened:
+            names = ", ".join(str(p) for p in sorted(opened)[:3])
+            more = f" 외 {len(opened) - 3}개" if len(opened) > 3 else ""
+            parts.append(f"{names}{more} 열림")
+        if closed:
+            names = ", ".join(str(p) for p in sorted(closed)[:3])
+            more = f" 외 {len(closed) - 3}개" if len(closed) > 3 else ""
+            parts.append(f"{names}{more} 닫힘")
+        text = " · ".join(parts)
+        self.toast(f"포트 {text}")
+        if not self.is_active():
+            note = Gio.Notification.new("PortWatch")
+            note.set_body(f"포트 {text}")
+            self.get_application().send_notification("portwatch-change", note)
 
     # ---------- 화면 구성
     def visible_rows(self):
@@ -525,8 +628,9 @@ class Window(Adw.ApplicationWindow):
     def render(self):
         rows = self.visible_rows()
         signature = json.dumps(
-            [[r["port"], r["pid"], r["kind"], r["section"], r["title"],
-              r["port"] in self.pinned] for r in rows], sort_keys=True)
+            [[[r["port"], r["pid"], r["kind"], r["section"], r["title"],
+               r.get("health"), r["port"] in self.pinned] for r in rows],
+             [p for p, _ in self.offline_favourites(rows)]], sort_keys=True)
         counts = (len([r for r in self.rows if r["section"] == "mine"]),
                   len([r for r in self.rows if r["section"] == "docker"]),
                   len(self.rows))
@@ -577,6 +681,15 @@ class Window(Adw.ApplicationWindow):
                 group.add(self.build_row(row))
             self.page.add(group)
 
+        offline = self.offline_favourites(rows)
+        if offline:
+            group = Adw.PreferencesGroup(
+                title=f"꺼진 즐겨찾기  ({len(offline)})",
+                description="즐겨찾기에 넣어 둔 포트인데 지금은 떠 있지 않습니다.")
+            for port, saved in offline:
+                group.add(self.build_offline_row(port, saved))
+            self.page.add(group)
+
     def build_row(self, row):
         web = row["kind"] in ("http", "https")
         action_row = Adw.ActionRow(
@@ -597,7 +710,14 @@ class Window(Adw.ApplicationWindow):
         action_row.add_prefix(pill)
 
         badges = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-        if row["kind"] != "tcp":
+        health = row.get("health")
+        if health:
+            code, ms = health
+            css = "badge-https" if code < 400 else "badge-public"
+            chip = self.badge(f"{code} · {ms}ms", css)
+            chip.set_tooltip_text("GET / 에 대한 응답 코드와 왕복 시간입니다")
+            badges.append(chip)
+        elif row["kind"] != "tcp":
             badges.append(self.badge(row["kind"].upper(), f"badge-{row['kind']}"))
         if row["docker"]:
             badges.append(self.badge("Docker", "badge-docker"))
@@ -617,7 +737,7 @@ class Window(Adw.ApplicationWindow):
         action_row.add_suffix(star)
 
         if web:
-            open_btn = Gtk.Button(icon_name="external-link-symbolic",
+            open_btn = Gtk.Button(icon_name="web-browser-symbolic",
                                   valign=Gtk.Align.CENTER, has_frame=False,
                                   tooltip_text="브라우저로 열기")
             open_btn.connect("clicked", lambda *_: self.open_row(row))
@@ -630,6 +750,7 @@ class Window(Adw.ApplicationWindow):
         menu.append("명령줄 복사", f"win.copy-cmd-{row['port']}")
         if row["cwd"]:
             menu.append("작업 디렉터리 열기", f"win.open-dir-{row['port']}")
+            menu.append("터미널에서 열기", f"win.open-term-{row['port']}")
 
         # 프로세스를 멈추는 항목은 되돌릴 수 없으므로 별도 구역에 둔다.
         stop = Gio.Menu()
@@ -663,6 +784,7 @@ class Window(Adw.ApplicationWindow):
             ]
         if row["cwd"]:
             defs.append((f"open-dir-{port}", lambda *_: self.open_path(row["cwd"])))
+            defs.append((f"open-term-{port}", lambda *_: self.open_terminal(row["cwd"])))
         for name, callback in defs:
             if self.lookup_action(name) is None:
                 self.add_simple_action(name, callback)
@@ -687,6 +809,164 @@ class Window(Adw.ApplicationWindow):
                 bits.append(f"가동 {row['uptime']}")
         bits.append(row["addrs"])
         return "   ·   ".join(bits)
+
+    # ---------- 꺼진 즐겨찾기 다시 띄우기
+    def offline_favourites(self, rows):
+        """즐겨찾기에 있지만 지금은 LISTEN 하지 않는 포트와 기억해 둔 실행 방법."""
+        if self.query or os.environ.get("PORTWATCH_DEMO"):
+            return []
+        live = {r["port"] for r in rows}
+        out = []
+        for port in sorted(self.pinned):
+            saved = self.commands.get(str(port))
+            if port not in live and saved:
+                out.append((port, saved))
+        return out
+
+    def build_offline_row(self, port, saved):
+        row = Adw.ActionRow(
+            title=GLib.markup_escape_text(saved["title"]),
+            subtitle=GLib.markup_escape_text(
+                f"{saved['cmdline'][:120]}   ·   {saved['cwd']}"))
+        row.set_subtitle_lines(2)
+
+        pill = Gtk.Label(label=str(port), valign=Gtk.Align.CENTER)
+        pill.add_css_class("port-pill")
+        pill.add_css_class("port-tcp")
+        row.add_prefix(pill)
+        row.add_suffix(self.badge("꺼짐", "badge"))
+
+        start = Gtk.Button(icon_name="media-playback-start-symbolic",
+                           valign=Gtk.Align.CENTER, has_frame=False,
+                           tooltip_text="기억해 둔 명령으로 다시 실행")
+        start.connect("clicked", lambda *_: self.confirm_restart(port, saved))
+        row.add_suffix(start)
+
+        forget = Gtk.Button(icon_name="user-trash-symbolic",
+                            valign=Gtk.Align.CENTER, has_frame=False,
+                            tooltip_text="기억해 둔 명령 지우기")
+        forget.connect("clicked", lambda *_: self.forget_command(port))
+        row.add_suffix(forget)
+        return row
+
+    def confirm_restart(self, port, saved):
+        dialog = Adw.MessageDialog(
+            transient_for=self, modal=True,
+            heading=f"{saved['title']} 을(를) 다시 띄울까요?",
+            body=f"{saved['cmdline']}\n\n작업 디렉터리: {saved['cwd']}\n\n"
+                 f"터미널에서 직접 실행할 때와 환경 변수가 다를 수 있습니다.")
+        dialog.add_response("cancel", "취소")
+        dialog.add_response("run", "실행")
+        dialog.set_response_appearance("run", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("run")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda d, r: r == "run" and self.restart(port, saved))
+        dialog.present()
+
+    def restart(self, port, saved):
+        if not os.path.isdir(saved["cwd"]):
+            self.toast("작업 디렉터리가 더 이상 없습니다")
+            return
+        try:
+            subprocess.Popen(shlex.split(saved["cmdline"]), cwd=saved["cwd"],
+                             start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            self.toast(f"실행하지 못했습니다 — {exc}")
+            return
+        self.toast(f"{saved['title']} 을(를) 실행했습니다")
+        GLib.timeout_add_seconds(2, self.force_reload)
+
+    def forget_command(self, port):
+        self.commands.pop(str(port), None)
+        self.cfg["commands"] = self.commands
+        save_config(self.cfg)
+        self.toast("기억해 둔 실행 명령을 지웠습니다")
+        self.force_reload()
+
+    # ---------- 도구: 포트 비우기 · 외부 노출 점검
+    def on_free_port(self, *_):
+        """'Address already in use' 를 푸는 화면. 포트를 입력하면 주인을 찾아 준다."""
+        entry = Gtk.Entry(placeholder_text="예: 8080", activates_default=True,
+                          input_purpose=Gtk.InputPurpose.DIGITS, margin_top=8)
+        dialog = Adw.MessageDialog(
+            transient_for=self, modal=True,
+            heading="포트 비우기",
+            body="쓰려는 포트 번호를 입력하면 그 포트를 쥐고 있는 프로세스를 찾습니다.")
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "취소")
+        dialog.add_response("find", "찾기")
+        dialog.set_response_appearance("find", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("find")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda d, r: r == "find" and self.find_owner(entry.get_text()))
+        dialog.present()
+        entry.grab_focus()
+
+    def find_owner(self, text):
+        try:
+            port = int(text.strip())
+        except ValueError:
+            self.toast("포트 번호를 숫자로 입력해 주세요")
+            return
+        row = self.row_by_port(port)
+        if row is None:
+            self.toast(f"{port} 번은 비어 있습니다 — 바로 쓰실 수 있습니다")
+            return
+        if self.can_kill(row):
+            self.confirm_kill(port)
+            return
+
+        if row["docker"] and row.get("container"):
+            advice = f"Docker 컨테이너 {row['container']} 가 쓰고 있습니다.\n" \
+                     f"docker stop {row['container']} 로 내릴 수 있습니다."
+        elif row["restricted"]:
+            advice = "다른 사용자(root)가 쓰고 있어 이 앱에서는 종료할 수 없습니다.\n" \
+                     f"터미널에서 sudo ss -ltnp 'sport = :{port}' 로 확인해 보세요."
+        else:
+            advice = "이 프로세스는 종료 대상이 아닙니다."
+        dialog = Adw.MessageDialog(
+            transient_for=self, modal=True,
+            heading=f"{port} 번은 {row['title']} 이(가) 쓰고 있습니다", body=advice)
+        dialog.add_response("ok", "알겠습니다")
+        dialog.present()
+
+    def on_exposure(self, *_):
+        """0.0.0.0 에 열린 포트를 모아 보여주고 위험한 조합을 짚는다."""
+        public = [r for r in self.rows if r["public"]]
+        if not public:
+            dialog = Adw.MessageDialog(
+                transient_for=self, modal=True, heading="외부에 열린 포트가 없습니다",
+                body="모든 포트가 127.0.0.1 에만 묶여 있습니다.")
+            dialog.add_response("ok", "닫기")
+            dialog.present()
+            return
+
+        risky, normal = [], []
+        for row in sorted(public, key=lambda r: r["port"]):
+            label = f"{row['port']}  {row['title']}  ({row['addrs']})"
+            service = RISKY_PORTS.get(row["port"])
+            (risky if service else normal).append(
+                f"{label}  ← {service}" if service else label)
+
+        body = ""
+        if risky:
+            body += ("아래 포트는 인증 없이 열려 있으면 특히 위험합니다.\n\n"
+                     + "\n".join(risky) + "\n\n")
+        if normal:
+            body += "그 밖에 외부에서 접근 가능한 포트입니다.\n\n" + "\n".join(normal)
+        body += ("\n\n같은 네트워크의 다른 장비에서 접근할 수 있습니다. "
+                 "개발용이라면 127.0.0.1 에만 묶는 편이 안전합니다.")
+
+        dialog = Adw.MessageDialog(
+            transient_for=self, modal=True,
+            heading=f"외부에 열린 포트 {len(public)}개", body=body)
+        dialog.add_response("copy", "목록 복사")
+        dialog.add_response("ok", "닫기")
+        dialog.set_default_response("ok")
+        dialog.connect("response", lambda d, r: r == "copy" and self.copy(
+            "\n".join(risky + normal), "노출 포트 목록을 복사했습니다"))
+        dialog.present()
 
     # ---------- 프로세스 종료
     @staticmethod
@@ -807,6 +1087,34 @@ class Window(Adw.ApplicationWindow):
             Gio.AppInfo.launch_default_for_uri(url_for(row), None)
         self.toast(f"{row['title']} 을(를) 브라우저에서 열었습니다 — {url_for(row)}")
 
+    TERMINALS = [
+        ("gnome-terminal", ["--working-directory"]),
+        ("kgx", ["--working-directory"]),          # GNOME Console
+        ("ptyxis", ["--working-directory"]),
+        ("konsole", ["--workdir"]),
+        ("xfce4-terminal", ["--working-directory"]),
+        ("alacritty", ["--working-directory"]),
+        ("kitty", ["--directory"]),
+        ("x-terminal-emulator", None),             # 작업 디렉터리 인자가 제각각이라 cwd 로만 연다
+    ]
+
+    def open_terminal(self, path):
+        if not os.path.isdir(path):
+            self.toast("작업 디렉터리가 더 이상 없습니다")
+            return
+        for name, flags in self.TERMINALS:
+            exe = GLib.find_program_in_path(name)
+            if not exe:
+                continue
+            cmd = [exe] + ([f"{flags[0]}={path}"] if flags else [])
+            try:
+                subprocess.Popen(cmd, cwd=path, start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception:
+                continue
+        self.toast("터미널 프로그램을 찾지 못했습니다")
+
     def open_path(self, path):
         Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(path, None), None)
 
@@ -818,6 +1126,11 @@ class Window(Adw.ApplicationWindow):
         port = row["port"]
         self.pinned.symmetric_difference_update({port})
         self.cfg["pinned"] = sorted(self.pinned)
+        if port in self.pinned and row["cmdline"] and row["cwd"] and not row["docker"]:
+            # 나중에 다시 띄울 수 있도록 실행 방법을 함께 적어 둔다.
+            self.commands[str(port)] = {
+                "title": row["title"], "cmdline": row["cmdline"], "cwd": row["cwd"]}
+            self.cfg["commands"] = self.commands
         save_config(self.cfg)
         self.signature = None
         self.render()

@@ -35,6 +35,25 @@ launch a browser, because the demo ports do not exist.
 - Match the existing style: 4 spaces, descriptive names, comments only where the reason is
   not obvious from the code.
 
+## Verifying without taking over the screen
+
+GUI changes are checked on a virtual display so the work never steals focus from whoever is
+using the machine:
+
+```bash
+Xvfb :99 -screen 0 1200x900x24 &
+env -u DBUS_SESSION_BUS_ADDRESS DISPLAY=:99 PORTWATCH_DEMO=1 \
+    dbus-run-session -- ./portwatch &
+DISPLAY=:99 xwininfo -root -tree | grep PortWatch     # find the window id
+DISPLAY=:99 xwd -id <id> -out shot.xwd                # capture it
+```
+
+`dbus-run-session` matters: PortWatch is a single-instance `Adw.Application`, so without its
+own session bus a second copy just wakes the one already running on the real display.
+
+Logic that does not need pixels — signals, dialogs, change detection — is checked by importing
+the file and driving the `Window` object without ever calling `present()`.
+
 ## Good first issues
 
 - **Internationalisation.** Strings are currently Korean literals in the source. Moving them

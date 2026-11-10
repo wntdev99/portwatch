@@ -51,6 +51,19 @@ PortWatch turns that raw socket list into something you can actually read — an
   alive three seconds later, PortWatch offers `SIGKILL` rather than sending it silently.
   Rows you do not own and rows inside a container never get the action — containers offer
   *copy `docker stop <name>`* instead.
+- **Free a port.** *포트 비우기* (free a port) in the menu: type the port you want, and
+  PortWatch finds whoever is holding it and offers to stop it. The answer to
+  `Address already in use`, without a round trip through `lsof`.
+- **Tells you what changed.** Ports that open or close between refreshes raise a toast, and a
+  desktop notification when the window is not focused. Your dev server died quietly? You know.
+- **Health at a glance.** Turn on *HTTP 상태 점검* and every HTTP row shows its status code and
+  round-trip time — `200 · 12ms`, or an amber `500 · 340ms` for the one that is up but broken.
+- **Exposure audit.** *외부 노출 점검* lists every port bound to `0.0.0.0`, and calls out the
+  ones that are dangerous unauthenticated — Redis, PostgreSQL, MongoDB, a bare Docker API.
+- **Restart what died.** A favourite remembers its command line and working directory, so a
+  port that is no longer listening appears under *꺼진 즐겨찾기* with a play button.
+- **SSH tunnels, readable.** A port opened by `ssh -L` is shown as
+  `SSH 터널 · 8080 → 10.0.0.5:80 (gateway 경유)` instead of a bare `ssh`.
 - **Live.** Auto-refreshes every 5 seconds, and only redraws when something actually changed.
 - **Native look.** GTK4 + libadwaita, follows your system light/dark preference, keyboard driven.
 
@@ -107,9 +120,13 @@ Launch it from your application grid, or run `portwatch` in a terminal.
 | Close the window | <kbd>Ctrl</kbd> + <kbd>W</kbd> |
 
 Each row also carries a star (favourite), an **open in browser** button, and a menu with
-*copy URL*, *copy command line* and *open working directory*. For a process you own, the
-menu ends with **프로세스 종료** (terminate), separated from the harmless entries and guarded
-by a confirmation dialog.
+*copy URL*, *copy command line*, *open working directory* and *open in terminal*. For a
+process you own, the menu ends with **프로세스 종료** (terminate), separated from the harmless
+entries and guarded by a confirmation dialog.
+
+The main menu holds the tools — *포트 비우기* (free a port) and *외부 노출 점검* (exposure
+audit) — and the view switches: system ports, auto refresh, HTTP health checks and change
+notifications.
 
 ## Requirements
 
@@ -145,9 +162,22 @@ Settings live in `~/.config/portwatch.json` and are written by the app itself:
 {
   "pinned": [3000, 8000],
   "show_system": false,
-  "auto_refresh": true
+  "auto_refresh": true,
+  "check_health": false,
+  "notify_changes": true,
+  "commands": {
+    "3000": {
+      "title": "storefront · Next.js",
+      "cmdline": "node node_modules/.bin/next dev --port 3000",
+      "cwd": "/home/you/work/storefront"
+    }
+  }
 }
 ```
+
+`commands` is written when you star a port, and is what the restart button replays.
+`check_health` is off by default: it sends one `GET /` per HTTP port on every refresh, which
+shows up in your dev server's log.
 
 Two environment variables are available, mainly for development and for taking screenshots:
 

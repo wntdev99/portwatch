@@ -8,7 +8,9 @@ from gi.repository import Adw, Gtk, Gio, GLib, Gdk, GObject  # noqa: E402
 
 import json
 import os
+import pwd
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -18,6 +20,8 @@ APP_ID = "dev.local.PortWatch"
 REFRESH_SEC = 5
 PROBE_TIMEOUT = 0.35
 CONFIG = os.path.expanduser("~/.config/portwatch.json")
+CURRENT_USER = pwd.getpwuid(os.getuid()).pw_name
+KILL_GRACE_SEC = 3
 
 SYSTEM_PORTS = {22, 53, 631, 5353, 41641, 5355}
 SYSTEM_PROCS = {"sshd", "cupsd", "systemd-resolve", "tailscaled", "avahi-daemon",
@@ -626,6 +630,16 @@ class Window(Adw.ApplicationWindow):
         menu.append("명령줄 복사", f"win.copy-cmd-{row['port']}")
         if row["cwd"]:
             menu.append("작업 디렉터리 열기", f"win.open-dir-{row['port']}")
+
+        # 프로세스를 멈추는 항목은 되돌릴 수 없으므로 별도 구역에 둔다.
+        stop = Gio.Menu()
+        if row["docker"] and row.get("container"):
+            stop.append("컨테이너 중지 명령 복사", f"win.docker-stop-{row['port']}")
+        elif self.can_kill(row):
+            stop.append("프로세스 종료", f"win.kill-{row['port']}")
+        if stop.get_n_items():
+            menu.append_section(None, stop)
+
         self.register_row_actions(row, web)
         more = Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=menu,
                               valign=Gtk.Align.CENTER, has_frame=False,
@@ -637,6 +651,10 @@ class Window(Adw.ApplicationWindow):
         port = row["port"]
         defs = [
             (f"copy-cmd-{port}", lambda *_: self.copy(row["cmdline"] or "-", "명령줄을 복사했습니다")),
+            # 포트로 최신 행을 다시 찾는다. 등록 시점의 PID를 그대로 쓰면
+            # 그 사이에 다른 프로세스가 포트를 넘겨받았을 때 엉뚱한 쪽을 죽이게 된다.
+            (f"kill-{port}", lambda *_: self.confirm_kill(port)),
+            (f"docker-stop-{port}", lambda *_: self.copy_docker_stop(port)),
         ]
         if web:
             defs += [
@@ -669,6 +687,118 @@ class Window(Adw.ApplicationWindow):
                 bits.append(f"가동 {row['uptime']}")
         bits.append(row["addrs"])
         return "   ·   ".join(bits)
+
+    # ---------- 프로세스 종료
+    @staticmethod
+    def can_kill(row):
+        """내가 소유한, 컨테이너 밖의 프로세스만 종료 대상으로 삼는다.
+
+        컨테이너 안의 프로세스를 직접 죽이면 재시작 정책에 따라 되살아나거나
+        컨테이너가 어중간한 상태로 남는다. 그쪽은 docker stop 으로 안내한다.
+        """
+        return (bool(row["pid"]) and not row["restricted"]
+                and not row["docker"] and row["user"] == CURRENT_USER)
+
+    def row_by_port(self, port):
+        for row in self.rows:
+            if row["port"] == port:
+                return row
+        return None
+
+    def copy_docker_stop(self, port):
+        row = self.row_by_port(port)
+        if not row or not row.get("container"):
+            self.toast("컨테이너 이름을 찾지 못했습니다")
+            return
+        self.copy(f"docker stop {row['container']}",
+                  f"docker stop {row['container']} 를 복사했습니다")
+
+    def confirm_kill(self, port):
+        row = self.row_by_port(port)
+        if row is None:
+            self.toast("이미 사라진 포트입니다")
+            self.reload()
+            return
+        if not self.can_kill(row):
+            self.toast("이 프로세스는 종료할 수 없습니다")
+            return
+
+        body = f"PID {row['pid']} · 포트 {row['port']}"
+        if row["cmdline"]:
+            body += f"\n{row['cmdline'][:160]}"
+        if row["uptime"]:
+            body += f"\n가동 {row['uptime']}"
+        body += "\n\n저장하지 않은 작업이 있다면 사라질 수 있습니다."
+
+        dialog = Adw.MessageDialog(
+            transient_for=self, modal=True,
+            heading=f"{row['title']} 을(를) 종료할까요?", body=body)
+        dialog.add_response("cancel", "취소")
+        dialog.add_response("kill", "종료")
+        dialog.set_response_appearance("kill", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self.on_kill_response, row)
+        dialog.present()
+
+    def on_kill_response(self, dialog, response, row):
+        if response != "kill":
+            return
+        self.send_signal(row, signal.SIGTERM, "종료 신호(SIGTERM)를 보냈습니다")
+
+    def send_signal(self, row, sig, message):
+        pid, title = row["pid"], row["title"]
+        if os.environ.get("PORTWATCH_DEMO"):
+            self.toast(f"데모 모드입니다 — 실제라면 {title} (PID {pid}) 에 "
+                       f"{sig.name} 을(를) 보냅니다")
+            return
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            self.toast(f"{title} 은(는) 이미 종료된 상태입니다")
+            self.force_reload()
+            return
+        except PermissionError:
+            self.toast(f"권한이 없어 {title} 을(를) 종료하지 못했습니다")
+            return
+        self.toast(f"{title} 에 {message}")
+        if sig is signal.SIGTERM:
+            GLib.timeout_add_seconds(KILL_GRACE_SEC, self.after_grace, row)
+        else:
+            GLib.timeout_add_seconds(1, self.force_reload)
+
+    def after_grace(self, row):
+        """SIGTERM을 보내고 기다린 뒤에도 살아 있으면 강제 종료를 묻는다."""
+        pid, title = row["pid"], row["title"]
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            self.toast(f"{title} 이(가) 종료되었습니다")
+            self.force_reload()
+            return False
+
+        dialog = Adw.MessageDialog(
+            transient_for=self, modal=True,
+            heading="아직 종료되지 않았습니다",
+            body=f"{title} (PID {pid}) 이(가) {KILL_GRACE_SEC}초가 지나도록 "
+                 f"종료 신호에 응답하지 않습니다.\n\n"
+                 f"강제로 종료하면(SIGKILL) 프로세스는 정리할 기회를 갖지 못합니다.")
+        dialog.add_response("wait", "더 기다리기")
+        dialog.add_response("force", "강제 종료")
+        dialog.set_response_appearance("force", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("wait")
+        dialog.set_close_response("wait")
+        dialog.connect(
+            "response",
+            lambda d, r: r == "force" and self.send_signal(
+                row, signal.SIGKILL, "강제 종료 신호(SIGKILL)를 보냈습니다"))
+        dialog.present()
+        return False
+
+    def force_reload(self):
+        self.signature = None
+        self.reload()
+        return False
 
     # ---------- 동작
     def open_row(self, row):

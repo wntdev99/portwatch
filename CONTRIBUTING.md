@@ -40,4 +40,3 @@ launch a browser, because the demo ports do not exist.
 - **Internationalisation.** Strings are currently Korean literals in the source. Moving them
   to `gettext` and adding an English catalogue would make the app usable far more widely.
 - **UDP listeners** as an optional section.
-- **A "copy as `kill <pid>`" action** for rows the user owns.

@@ -46,6 +46,11 @@ PortWatch turns that raw socket list into something you can actually read — an
 - **Protocol detection.** Each port is probed once and labelled HTTP, HTTPS or plain TCP,
   so you never open a browser tab against a PostgreSQL socket.
 - **Favourites.** Star the three ports you open all day; they float to the top.
+- **Stop what you started.** A row you own offers *프로세스 종료* (terminate): a confirmation
+  dialog showing the PID, command line and uptime, then `SIGTERM`. If the process is still
+  alive three seconds later, PortWatch offers `SIGKILL` rather than sending it silently.
+  Rows you do not own and rows inside a container never get the action — containers offer
+  *copy `docker stop <name>`* instead.
 - **Live.** Auto-refreshes every 5 seconds, and only redraws when something actually changed.
 - **Native look.** GTK4 + libadwaita, follows your system light/dark preference, keyboard driven.
 
@@ -102,7 +107,9 @@ Launch it from your application grid, or run `portwatch` in a terminal.
 | Close the window | <kbd>Ctrl</kbd> + <kbd>W</kbd> |
 
 Each row also carries a star (favourite), an **open in browser** button, and a menu with
-*copy URL*, *copy command line* and *open working directory*.
+*copy URL*, *copy command line* and *open working directory*. For a process you own, the
+menu ends with **프로세스 종료** (terminate), separated from the harmless entries and guarded
+by a confirmation dialog.
 
 ## Requirements
 
@@ -155,6 +162,9 @@ Two environment variables are available, mainly for development and for taking s
   another user's process to `ss` unless you are root. PortWatch deliberately does not run
   itself as root; for those rows it falls back to a well-known-port guess (`6379 → Redis`).
 - **TCP only.** UDP listeners are not shown. Most things you want to click are TCP.
+- **Terminating is limited to your own processes.** PortWatch sends signals as your user and
+  never escalates. A container's process is left to `docker stop`, because killing PID 1
+  inside a container only triggers its restart policy.
 - **The interface is in Korean.** The app was written for a Korean-speaking team.
   Internationalisation is welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

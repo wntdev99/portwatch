@@ -22,7 +22,10 @@ make check      # byte-compile
 ```
 
 `PORTWATCH_COLOR_SCHEME=prefer-light make demo` forces the light theme, which is how the
-screenshots in `docs/` are produced.
+screenshots in `docs/` are produced. The demo GIF is recorded the same way: run `make demo`,
+size the window to 980x700, capture with `ffmpeg -f x11grab`, and convert with a
+`palettegen`/`paletteuse` pair. In demo mode a row click only shows the toast — it does not
+launch a browser, because the demo ports do not exist.
 
 ## Pull requests
 

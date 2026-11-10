@@ -9,7 +9,9 @@
 
 [English README](README.md)
 
-<img src="docs/screenshot-dark.png" alt="PortWatch 다크 모드 화면" width="820">
+<img src="docs/demo.gif" alt="포트를 즐겨찾기에 추가하고, 이름으로 검색하고, 브라우저로 열고, Docker 컨테이너까지 훑어보는 화면" width="820">
+
+<sub>별을 눌러 고정 · 이름이나 명령줄로 검색 · 클릭해서 브라우저로 열기 · Docker 컨테이너는 이름으로 표시</sub>
 
 </div>
 
@@ -42,7 +44,11 @@ PortWatch는 그 소켓 목록을 읽고 바로 행동할 수 있는 화면으�
 - **네이티브한 모양새.** GTK4와 libadwaita를 쓰고, 시스템의 밝게·어둡게 설정을 따라갑니다.
 
 <div align="center">
+<img src="docs/screenshot-dark.png" alt="PortWatch 다크 모드 화면" width="700">
+&nbsp;
 <img src="docs/screenshot-light.png" alt="PortWatch 라이트 모드 화면" width="700">
+<br>
+<sub>시스템의 밝게·어둡게 설정을 그대로 따라갑니다.</sub>
 </div>
 
 ## 설치

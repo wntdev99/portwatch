@@ -15,7 +15,9 @@ A small, native GNOME app that answers the question every developer asks ten tim
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776ab.svg)](https://www.python.org/)
 [![No dependencies to install](https://img.shields.io/badge/pip%20install-not%20required-success.svg)](#requirements)
 
-<img src="docs/screenshot-dark.png" alt="PortWatch in dark mode, grouping listening ports into favourites, local servers and Docker containers" width="820">
+<img src="docs/demo.gif" alt="Starring a port, searching by name, opening a server in the browser and scrolling through Docker containers" width="820">
+
+<sub>Star a port · search by name or command line · click to open in the browser · Docker containers resolved by name</sub>
 
 </div>
 
@@ -48,7 +50,11 @@ PortWatch turns that raw socket list into something you can actually read — an
 - **Native look.** GTK4 + libadwaita, follows your system light/dark preference, keyboard driven.
 
 <div align="center">
+<img src="docs/screenshot-dark.png" alt="PortWatch in dark mode" width="700">
+&nbsp;
 <img src="docs/screenshot-light.png" alt="PortWatch in light mode" width="700">
+<br>
+<sub>Follows your system light/dark preference.</sub>
 </div>
 
 ## Install

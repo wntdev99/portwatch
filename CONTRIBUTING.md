@@ -4,11 +4,14 @@ Thanks for taking the time. PortWatch is small on purpose, and the goal is to ke
 
 ## Ground rules
 
-1. **One file, no dependencies.** The whole app is `portwatch`, a single Python script that
-   runs on a stock GNOME install. Please do not add anything that requires `pip install`.
-2. **Never require root.** Reading another user's process is out of scope. If information is
+1. **No dependencies on Linux.** PortWatch runs on a stock GNOME install with nothing from
+   PyPI. `psutil` is an optional extra that only macOS and Windows pull in. Please do not add
+   a third-party import to anything under `core/` or `gtk_app.py` without a fallback.
+2. **Platform differences live in `core/platform.py`.** If you write `/proc` or `ss` anywhere
+   else, it will break the macOS and Windows builds — the CI runs on all three.
+3. **Never require root.** Reading another user's process is out of scope. If information is
    not available to the current user, the UI says so instead of escalating.
-3. **Keep the refresh cheap.** The 5-second refresh must not probe a port twice or shell out
+4. **Keep the refresh cheap.** The 5-second refresh must not probe a port twice or shell out
    per row. Cache anything that cannot change.
 
 ## Development
@@ -16,9 +19,19 @@ Thanks for taking the time. PortWatch is small on purpose, and the goal is to ke
 ```bash
 git clone https://github.com/wntdev99/portwatch.git
 cd portwatch
-make run        # run against your real sockets
-make demo       # run against fixed fake data — useful for UI work and screenshots
-make check      # byte-compile
+make run        # the OS default screen, against your real sockets
+make web        # the browser screen
+make demo       # fixed fake data — useful for UI work and screenshots
+make check      # byte-compile and collect once
+```
+
+The web screen's screenshots are taken with headless Chrome against `PORTWATCH_DEMO=1`:
+
+```bash
+PORTWATCH_DEMO=1 python3 -m portwatch --web --port 7882 --no-browser &
+TOKEN=$(curl -s http://127.0.0.1:7882/ | grep -o 'data-token="[^"]*"' | cut -d'"' -f2)
+google-chrome --headless=new --window-size=1080,820 \
+  --screenshot=docs/web-dark.png "http://127.0.0.1:7882/?t=$TOKEN"
 ```
 
 `PORTWATCH_COLOR_SCHEME=prefer-light make demo` forces the light theme, which is how the

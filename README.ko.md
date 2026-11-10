@@ -68,7 +68,25 @@ PortWatch는 그 소켓 목록을 읽고 바로 행동할 수 있는 화면으�
 <sub>시스템의 밝게·어둡게 설정을 그대로 따라갑니다.</sub>
 </div>
 
+## 화면은 둘, 코어는 하나
+
+Linux에서는 GTK4 네이티브 창으로, 그 밖의 OS에서는 로컬 웹 화면으로 뜹니다. 두 화면이 같은
+코어를 읽으므로 기능은 한 번만 만들면 양쪽에 모두 나타납니다.
+
+- **GTK4 창** (`portwatch`) — Linux 기본, 의존성 없음
+- **웹 화면** (`portwatch --web`) — macOS·Windows 기본이며 Linux에서도 쓸 수 있음, `psutil` 필요
+
+웹 화면은 `127.0.0.1`에만 묶이고, 실행할 때마다 새 토큰을 만들어 모든 API 호출에 요구하며,
+토큰이 없거나 다른 사이트에서 온 요청은 거부합니다. 네트워크에 노출되는 것은 없습니다.
+
+<div align="center">
+<img src="docs/web-dark.png" alt="macOS와 Windows에서 쓰는 PortWatch 웹 화면" width="760">
+<br><sub>웹 화면 — 같은 섹션, 같은 동작, 어떤 OS에서든.</sub>
+</div>
+
 ## 설치
+
+**Linux** — 가상 환경도 `pip install`도 필요 없습니다.
 
 ```bash
 git clone https://github.com/wntdev99/portwatch.git
@@ -76,14 +94,22 @@ cd portwatch
 make install
 ```
 
-가상 환경도, `pip install`도 필요 없습니다. Python 파일 하나를 `~/.local/bin/portwatch`에
-복사하고 데스크톱 항목을 등록하므로, 런처에서 "PortWatch"로 검색하면 바로 나옵니다.
+**macOS와 Windows** — 포트를 읽는 일은 `psutil`이 맡습니다.
+
+```bash
+pip install "portwatch[cross] @ git+https://github.com/wntdev99/portwatch"
+portwatch            # 브라우저에 웹 화면이 열립니다
+```
+
+클론한 자리에서 바로 실행하려면 `python3 -m portwatch`를 쓰면 됩니다. `--web`을 붙이면 어느
+OS에서든 웹 화면으로 뜨고, `PORTWATCH_DEMO=1`을 앞에 붙이면 가상 데이터로 뜹니다.
 
 제거는 `make uninstall`이며, 실행 파일과 데스크톱 항목, 설정 파일을 모두 지웁니다.
 
 ## 사용법
 
-런처에서 실행하거나 터미널에서 `portwatch`를 입력합니다.
+런처에서 실행하거나 터미널에서 `portwatch`를 입력합니다. `--web`은 웹 화면을 강제하고,
+`--port`는 기본 7878번을 바꾸며, `--no-browser`는 브라우저를 자동으로 열지 않습니다.
 
 | 동작 | 단축키 |
 | --- | --- |
@@ -102,12 +128,14 @@ make install
 
 ## 요구 사항
 
-- GTK4가 올라간 Linux 데스크톱 (Ubuntu 24.04 / GNOME 46에서 개발·검증)
-- Python 3.10 이상
-- `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1`, 그리고 `iproute2`의 `ss`
+- Linux, macOS 11 이상, Windows 10 이상
+- Python 3.9 이상
+- Linux: `iproute2`의 `ss`. GTK 창을 쓰려면 `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1`
+- macOS·Windows: `psutil`. macOS에서 `psutil`이 없으면 `lsof`로 물러납니다
 - `docker`는 선택 사항이며 컨테이너 이름을 찾는 데에만 씁니다
 
-Ubuntu와 Debian의 기본 GNOME 설치에는 모두 들어 있습니다. 없다면 아래와 같이 설치합니다.
+Ubuntu와 Debian의 기본 GNOME 설치에는 GTK 관련 항목이 모두 들어 있습니다. 없다면 아래와 같이
+설치합니다.
 
 ```bash
 sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 iproute2
@@ -115,12 +143,20 @@ sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 iproute2
 
 ## 동작 방식
 
-1. `ss -ltnpH`로 LISTEN 상태인 TCP 소켓을 모두 읽습니다.
-2. 소유자를 읽을 수 있는 소켓은 `/proc/<pid>/{cmdline,cwd,cgroup}`에서 명령줄, 작업
-   디렉터리, 컨테이너 소속 여부를 채웁니다.
+1. LISTEN 상태인 TCP 소켓을 읽습니다. Linux는 `ss -ltnpH`, macOS와 Windows는
+   `psutil.net_connections`를 쓰고, macOS가 root 없이 거부하면 `lsof`로 물러납니다.
+2. 프로세스 정보는 Linux에서 `/proc/<pid>/{cmdline,cwd,cgroup}`, 그 밖의 OS에서는 `psutil`로
+   채웁니다. 명령줄, 작업 디렉터리, 소유자, 가동 시간, 컨테이너 소속 여부입니다.
 3. 각 포트에 `GET / HTTP/1.0`을 **한 번만** 보내 HTTP·HTTPS·TCP를 판별하고 결과를
    캐시합니다. 그래서 5초 갱신이 부담되지 않습니다.
 4. 같은 프로세스의 IPv4·IPv6 행은 하나로 합칩니다.
+
+```
+portwatch/
+  core/        collect · probe · actions · platform · config   ← 3개 OS 공통
+  gtk_app.py   GTK4 + libadwaita 창                            ← Linux
+  web/         로컬 HTTP 서버와 단일 페이지 화면                 ← 어디서나
+```
 
 모든 동작은 현재 사용자 권한으로 이루어집니다. root 권한을 요구하지 않고 시스템에 쓰지 않습니다.
 
@@ -162,6 +198,12 @@ sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 iproute2
   남의 프로세스를 `ss`에 알려 주지 않기 때문입니다. PortWatch는 의도적으로 root로 실행하지
   않으며, 그런 행은 잘 알려진 포트 번호로 서비스를 추정해 표시합니다(`6379 → Redis`).
 - **TCP만 봅니다.** UDP 리스너는 표시하지 않습니다. 클릭해서 열고 싶은 것은 대부분 TCP입니다.
+- **macOS는 남의 소켓을 숨깁니다.** `psutil.net_connections`가 그곳에서는 root를 요구하므로,
+  권한이 없으면 `lsof`로 물러나 내가 띄운 프로세스만 보여줍니다. 애초에 그것을 보려고 쓰는
+  도구이니 실용적으로는 문제가 없습니다. root로 실행하면 전부 보이지만 권장하지 않습니다.
+- **GTK 창은 Linux 전용입니다.** GTK4와 libadwaita가 macOS·Windows에서 돌기는 하지만, 작은
+  유틸리티 하나를 쓰려고 Homebrew나 MSYS2로 수백 MB를 설치하라고 할 수는 없습니다. 웹 화면이
+  바로 그 때문에 있습니다.
 - **종료는 내 프로세스에만 가능합니다.** 신호는 현재 사용자 권한으로 보내며 권한을 올리지
   않습니다. 컨테이너 안의 프로세스는 `docker stop`에 맡깁니다. 컨테이너의 PID 1을 죽여 봐야
   재시작 정책이 되살릴 뿐입니다.

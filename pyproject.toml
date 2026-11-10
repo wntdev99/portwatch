@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portwatch"
+version = "0.3.0"
+description = "See every port your machine is listening on, and open the web ones in a single click"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "wntdev99" }]
+keywords = ["ports", "localhost", "developer-tools", "gtk4", "docker"]
+classifiers = [
+  "Environment :: X11 Applications :: GTK",
+  "Environment :: Web Environment",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Linux 는 ss 와 /proc 만으로 돌지만, macOS 와 Windows 는 psutil 이 필요하다.
+cross = ["psutil>=5.9"]
+
+[project.scripts]
+portwatch = "portwatch.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/wntdev99/portwatch"
+Issues = "https://github.com/wntdev99/portwatch/issues"
+
+[tool.setuptools.packages.find]
+include = ["portwatch*"]
+
+[tool.setuptools.package-data]
+"portwatch.web" = ["static/*"]

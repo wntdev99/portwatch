@@ -10,10 +10,10 @@ A small, native GNOME app that answers the question every developer asks ten tim
 [한국어 README](README.ko.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform: Linux](https://img.shields.io/badge/Platform-Linux-informational.svg)](#requirements)
+[![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-informational.svg)](#requirements)
 [![GTK4 + libadwaita](https://img.shields.io/badge/GTK4-libadwaita-4a86cf.svg)](https://gnome.pages.gitlab.gnome.org/libadwaita/)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776ab.svg)](https://www.python.org/)
-[![No dependencies to install](https://img.shields.io/badge/pip%20install-not%20required-success.svg)](#requirements)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776ab.svg)](https://www.python.org/)
+[![No dependencies on Linux](https://img.shields.io/badge/Linux-no%20dependencies-success.svg)](#requirements)
 
 <img src="docs/demo.gif" alt="Starring a port, searching by name, opening a server in the browser and scrolling through Docker containers" width="820">
 
@@ -75,7 +75,28 @@ PortWatch turns that raw socket list into something you can actually read — an
 <sub>Follows your system light/dark preference.</sub>
 </div>
 
+## Two screens, one core
+
+PortWatch has a native GTK4 window on Linux and a local web screen everywhere else. Both read
+the same core, so a feature exists once and shows up in both.
+
+| | Linux | macOS | Windows |
+| --- | :---: | :---: | :---: |
+| GTK4 window (`portwatch`) | default | — | — |
+| Web screen (`portwatch --web`) | yes | default | default |
+| Dependencies | none | `psutil` | `psutil` |
+
+The web screen binds to `127.0.0.1` only, mints a fresh token on every launch, and rejects any
+request without that token or carrying a foreign `Origin`. Nothing is exposed to your network.
+
+<div align="center">
+<img src="docs/web-dark.png" alt="The PortWatch web screen on macOS and Windows" width="760">
+<br><sub>The web screen — same sections, same actions, any OS.</sub>
+</div>
+
 ## Install
+
+**Linux** — no virtualenv, no `pip install`:
 
 ```bash
 git clone https://github.com/wntdev99/portwatch.git
@@ -83,17 +104,20 @@ cd portwatch
 make install
 ```
 
-That is it — no virtualenv, no `pip install`. `make install` copies a single Python file to
-`~/.local/bin/portwatch` and registers a desktop entry, so PortWatch shows up in your
-application launcher.
-
-<details>
-<summary>Manual install (no <code>make</code>)</summary>
+**macOS and Windows** — `psutil` does the reading there:
 
 ```bash
-install -Dm755 portwatch ~/.local/bin/portwatch
-install -Dm644 data/portwatch.desktop ~/.local/share/applications/portwatch.desktop
-update-desktop-database ~/.local/share/applications
+pip install "portwatch[cross] @ git+https://github.com/wntdev99/portwatch"
+portwatch            # opens the web screen in your browser
+```
+
+<details>
+<summary>Run straight from a clone, without installing</summary>
+
+```bash
+python3 -m portwatch          # the OS default screen
+python3 -m portwatch --web    # force the web screen
+PORTWATCH_DEMO=1 python3 -m portwatch   # fake data, for screenshots
 ```
 
 </details>
@@ -102,14 +126,15 @@ update-desktop-database ~/.local/share/applications
 <summary>Uninstall</summary>
 
 ```bash
-make uninstall          # removes the binary, the desktop entry and the config file
+make uninstall       # removes the program, the desktop entry and the config file
 ```
 
 </details>
 
 ## Usage
 
-Launch it from your application grid, or run `portwatch` in a terminal.
+Launch it from your application grid, or run `portwatch` in a terminal. `--web` forces the
+browser screen on any OS, `--port` moves it off 7878, `--no-browser` leaves the tab to you.
 
 | Action | Shortcut |
 | --- | --- |
@@ -132,12 +157,13 @@ notifications.
 
 | | |
 | --- | --- |
-| OS | Linux with a GTK4 desktop (developed and tested on Ubuntu 24.04 / GNOME 46) |
-| Python | 3.10 or newer |
-| Libraries | `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1` |
-| Tools | `ss` (from `iproute2`); `docker` is optional and only used for container names |
+| OS | Linux, macOS 11+, Windows 10+ |
+| Python | 3.9 or newer |
+| Linux | `ss` (from `iproute2`); for the GTK window, `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1` |
+| macOS · Windows | `psutil`; `lsof` is the fallback on macOS when `psutil` is missing |
+| Optional | `docker`, used only to resolve container names |
 
-On Ubuntu and Debian these are present on a default GNOME install. If not:
+On Ubuntu and Debian the GTK pieces are present on a default GNOME install. If not:
 
 ```bash
 sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 iproute2
@@ -145,12 +171,20 @@ sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 iproute2
 
 ## How it works
 
-1. `ss -ltnpH` lists every TCP socket in `LISTEN` state.
-2. For each socket with a readable owner, `/proc/<pid>/{cmdline,cwd,cgroup}` fills in the
-   command line, the working directory and whether the process lives inside a container.
+1. Listening sockets come from `ss -ltnpH` on Linux and from `psutil.net_connections` on
+   macOS and Windows, falling back to `lsof` when macOS refuses `psutil` without root.
+2. Process details come from `/proc/<pid>/{cmdline,cwd,cgroup}` on Linux and from `psutil`
+   elsewhere: command line, working directory, owner, uptime, and container membership.
 3. Each port is probed **once** with a single `GET / HTTP/1.0` to classify it as HTTP, HTTPS
    or plain TCP. The result is cached, so the 5-second refresh costs nothing.
 4. IPv4 and IPv6 rows for the same process are merged into one entry.
+
+```
+portwatch/
+  core/        collect · probe · actions · platform · config   ← all three OSes
+  gtk_app.py   GTK4 + libadwaita window                        ← Linux
+  web/         local HTTP server + a single-page screen        ← everywhere
+```
 
 Everything runs as your user. PortWatch never asks for root and never writes to the system.
 
@@ -192,6 +226,12 @@ Two environment variables are available, mainly for development and for taking s
   another user's process to `ss` unless you are root. PortWatch deliberately does not run
   itself as root; for those rows it falls back to a well-known-port guess (`6379 → Redis`).
 - **TCP only.** UDP listeners are not shown. Most things you want to click are TCP.
+- **macOS hides other users' sockets.** `psutil.net_connections` needs root there, so without
+  it PortWatch falls back to `lsof` and shows the processes you own — which is what you
+  actually came for. Running it as root would show everything, and is not recommended.
+- **The GTK window is Linux-only.** GTK4 and libadwaita do run on macOS and Windows, but
+  asking you to install them through Homebrew or MSYS2 is not a reasonable price for a small
+  utility. The web screen exists for exactly that reason.
 - **Terminating is limited to your own processes.** PortWatch sends signals as your user and
   never escalates. A container's process is left to `docker stop`, because killing PID 1
   inside a container only triggers its restart policy.

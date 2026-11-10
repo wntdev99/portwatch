@@ -2,13 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, devel]
   pull_request:
 
 jobs:
   check:
-    name: Byte-compile and lint
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -16,16 +20,43 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install
+        run: pip install -e ".[cross]"
+
       - name: Byte-compile
-        run: python3 -m py_compile portwatch
+        run: python -m compileall -q portwatch
+
+      - name: Collect real listeners
+        run: python -c "from portwatch.core import collect; rows = collect(); print(len(rows), 'rows'); [print(' ', r['port'], r['title'], r['kind']) for r in rows[:5]]"
+
+      - name: Demo data renders
+        env:
+          PORTWATCH_DEMO: "1"
+        run: python -c "from portwatch.core import collect; rows = collect(); assert len(rows) == 9, rows; print('demo ok')"
+
+      - name: Web server answers
+        shell: bash
+        run: |
+          python -m portwatch --web --port 7899 --no-browser &
+          sleep 4
+          TOKEN=$(curl -s http://127.0.0.1:7899/ | grep -o 'data-token="[^"]*"' | cut -d'"' -f2)
+          test -n "$TOKEN"
+          curl -sf -H "X-PortWatch-Token: $TOKEN" http://127.0.0.1:7899/api/state > /dev/null
+          echo "authorised request ok"
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:7899/api/state)
+          test "$code" = "403" && echo "unauthenticated request rejected"
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-PortWatch-Token: $TOKEN" -H "Origin: https://evil.example" http://127.0.0.1:7899/api/state)
+          test "$code" = "403" && echo "cross-origin request rejected"
 
       - name: Lint
         run: |
-          pipx install ruff
+          pip install ruff
           ruff check --select E9,F63,F7,F82 portwatch
 
-      - name: Validate desktop entry
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y desktop-file-utils
-          desktop-file-validate data/portwatch.desktop
+  desktop-entry:
+    name: desktop entry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y desktop-file-utils
+      - run: desktop-file-validate data/portwatch.desktop

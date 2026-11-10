@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PortWatch</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🛰️</text></svg>">
+</head>
+<body data-token="__TOKEN__">
+<header>
+  <div>
+    <h1>PortWatch</h1>
+    <div class="sub" id="summary">읽는 중…</div>
+  </div>
+  <div class="spacer"></div>
+  <input type="search" id="search" placeholder="포트, 이름, 명령줄로 검색" autocomplete="off">
+  <button id="refresh" title="새로고침 (R)">↻</button>
+  <button id="freePort">포트 비우기</button>
+  <button id="exposure">노출 점검</button>
+  <label class="toggle"><input type="checkbox" id="showSystem"> 시스템</label>
+  <label class="toggle"><input type="checkbox" id="checkHealth"> 상태</label>
+</header>
+
+<main id="main"><div class="empty">읽는 중…</div></main>
+
+<dialog id="dialog">
+  <div class="body">
+    <h3 id="dlgTitle"></h3>
+    <pre id="dlgBody"></pre>
+    <div id="dlgExtra"></div>
+  </div>
+  <div class="foot" id="dlgFoot"></div>
+</dialog>
+
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

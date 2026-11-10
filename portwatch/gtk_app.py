@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
-"""PortWatch — 로컬에서 LISTEN 중인 포트를 한눈에 보고 브라우저로 여는 GNOME 앱."""
+"""PortWatch 의 GTK4 + libadwaita 화면 (Linux).
+
+데이터 수집과 실제 동작은 portwatch.core 가 담당하고, 이 파일은 화면만 그린다.
+"""
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -8,371 +10,23 @@ from gi.repository import Adw, Gtk, Gio, GLib, Gdk, GObject  # noqa: E402
 
 import json
 import os
-import pwd
-import re
-import shlex
-import signal
-import socket
-import subprocess
-import threading
-import time
+
+from .core import actions
+from .core import config as config_mod
+from .core.collect import collect, can_kill, CURRENT_USER, RISKY_PORTS
+from .core.probe import url_for
 
 APP_ID = "dev.local.PortWatch"
 REFRESH_SEC = 5
-PROBE_TIMEOUT = 0.35
-CONFIG = os.path.expanduser("~/.config/portwatch.json")
-CURRENT_USER = pwd.getpwuid(os.getuid()).pw_name
 KILL_GRACE_SEC = 3
-HEALTH_TIMEOUT = 1.0
 
-# 인증 없이 외부에 열려 있으면 특히 위험한 포트
-RISKY_PORTS = {
-    6379: "Redis", 5432: "PostgreSQL", 3306: "MySQL", 27017: "MongoDB",
-    11211: "Memcached", 9200: "Elasticsearch", 5672: "RabbitMQ",
-    2375: "Docker API", 9000: "관리 콘솔", 8086: "InfluxDB",
-}
-
-SYSTEM_PORTS = {22, 53, 631, 5353, 41641, 5355}
-SYSTEM_PROCS = {"sshd", "cupsd", "systemd-resolve", "tailscaled", "avahi-daemon",
-                "jumpcloud-agent", "jumpcloud-assist-service", "rustdesk", "glances"}
-
-# 프로세스를 읽을 수 없을 때 포트 번호만으로 짐작하는 서비스 이름
-WELL_KNOWN = {
-    22: "SSH", 53: "DNS", 80: "HTTP", 443: "HTTPS", 631: "CUPS 인쇄",
-    1883: "MQTT", 3000: "개발 서버", 3306: "MySQL", 5000: "개발 서버",
-    5432: "PostgreSQL", 5433: "PostgreSQL", 5672: "RabbitMQ", 5900: "VNC",
-    6379: "Redis", 7070: "원격 관리", 8000: "개발 서버", 8080: "HTTP 대체",
-    8443: "HTTPS 대체", 9000: "개발 서버", 9090: "Prometheus", 11211: "Memcached",
-    27017: "MongoDB", 41641: "Tailscale", 61209: "Glances",
-}
-
-# ---------------------------------------------------------------- 데이터 수집
-
-_probe_cache = {}
-_probe_lock = threading.Lock()
-_name_cache = {}
-
-
-def sh(cmd, timeout=5):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
-    except Exception:
-        return ""
-
-
-def split_addr(endpoint):
-    if endpoint.startswith("["):
-        host, _, port = endpoint.rpartition("]:")
-        return host[1:], port
-    host, _, port = endpoint.rpartition(":")
-    return host.split("%")[0], port
-
-
-def connect_host(addr):
-    return "127.0.0.1" if addr in ("0.0.0.0", "*", "::", "") else addr
-
-
-def proc_info(pid):
-    info = {"user": "?", "cmdline": "", "cwd": "", "docker": False, "uptime": ""}
-    try:
-        info["user"] = sh(["stat", "-c", "%U", f"/proc/{pid}"]).strip() or "?"
-    except Exception:
-        pass
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            info["cmdline"] = fh.read().replace(b"\0", b" ").decode(errors="replace").strip()
-    except Exception:
-        pass
-    try:
-        info["cwd"] = os.readlink(f"/proc/{pid}/cwd")
-    except Exception:
-        pass
-    try:
-        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as fh:
-            text = fh.read()
-            info["docker"] = "docker" in text or "containerd" in text
-    except Exception:
-        pass
-    try:
-        info["uptime"] = sh(["ps", "-o", "etime=", "-p", str(pid)]).strip()
-    except Exception:
-        pass
-    return info
-
-
-_docker_names = {}
-_docker_stamp = 0.0
-
-
-def docker_names():
-    """컨테이너 ID 앞 12자리 -> 컨테이너 이름. 10초간 캐시한다."""
-    global _docker_stamp
-    now = time.time()
-    if _docker_names and now - _docker_stamp < 10:
-        return _docker_names
-    out = sh(["docker", "ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"], timeout=3)
-    if out:
-        _docker_names.clear()
-        for line in out.splitlines():
-            cid, _, name = line.partition("\t")
-            if cid and name:
-                _docker_names[cid[:12]] = name
-    _docker_stamp = now
-    return _docker_names
-
-
-def container_of(pid):
-    try:
-        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as fh:
-            text = fh.read()
-    except Exception:
-        return None
-    m = re.search(r"([0-9a-f]{12})[0-9a-f]*", text)
-    if not m:
-        return None
-    return docker_names().get(m.group(1))
-
-
-def ssh_tunnel(cmd):
-    """ssh -L 포워딩 명령에서 '내 포트 -> 원격' 설명을 만든다."""
-    m = re.search(r"-L\s*(?:(\S+?):)?(\d+):(\S+?):(\d+)", cmd)
-    if not m:
-        return None
-    _, local, host, remote = m.groups()
-    target = re.search(r"(?:^|\s)([\w.-]+@[\w.-]+|[\w.-]+)\s*$", cmd.strip())
-    via = f" ({target.group(1)} 경유)" if target else ""
-    return f"{local} → {host}:{remote}{via}"
-
-
-def friendly_name(row):
-    """프로세스와 작업 디렉터리에서 사람이 읽을 이름을 뽑는다."""
-    key = (row["pid"], row["port"])
-    if key in _name_cache:
-        return _name_cache[key]
-
-    cmd, cwd, name = row["cmdline"], row["cwd"], row["name"]
-    label = row.get("container")
-
-    if cwd and os.path.isdir(cwd):
-        for pkg in ("package.json",):
-            path = os.path.join(cwd, pkg)
-            if os.path.isfile(path):
-                try:
-                    with open(path, encoding="utf-8") as fh:
-                        label = json.load(fh).get("name")
-                except Exception:
-                    pass
-
-    if not label:
-        m = re.search(r"--directory\s+(\S+)", cmd)
-        if m:
-            label = os.path.basename(m.group(1).rstrip("/")) or None
-
-    if not label and cwd and cwd not in ("/", os.path.expanduser("~")):
-        label = os.path.basename(cwd.rstrip("/")) or None
-
-    if not label:
-        label = name or f"포트 {row['port']}"
-
-    tunnel = ssh_tunnel(cmd) if name == "ssh" else None
-    if tunnel:
-        _name_cache[key] = f"SSH 터널 · {tunnel}"
-        return _name_cache[key]
-
-    runtime = ""
-    if "vite" in cmd:
-        runtime = "Vite"
-    elif "uvicorn" in cmd:
-        runtime = "uvicorn"
-    elif "http.server" in cmd:
-        runtime = "http.server"
-    elif name in ("node", "bun", "python3", "deno"):
-        runtime = name
-    elif row["docker"]:
-        runtime = "Docker"
-
-    text = f"{label} · {runtime}" if runtime and runtime.lower() != label.lower() else label
-    _name_cache[key] = text
-    return text
-
-
-def probe(addr, port):
-    key = (addr, port)
-    with _probe_lock:
-        if key in _probe_cache:
-            return _probe_cache[key]
-    host = connect_host(addr)
-    kind = "tcp"
-    try:
-        family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        with socket.socket(family, socket.SOCK_STREAM) as sock:
-            sock.settimeout(PROBE_TIMEOUT)
-            sock.connect((host, port))
-            sock.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
-            head = sock.recv(16)
-            if head.startswith(b"HTTP/"):
-                kind = "http"
-            elif head[:1] in (b"\x15", b"\x16"):
-                kind = "https"
-    except (socket.timeout, ConnectionResetError):
-        kind = "https" if port in (443, 8443) else "tcp"
-    except Exception:
-        kind = "tcp"
-    with _probe_lock:
-        _probe_cache[key] = kind
-    return kind
-
-
-def health_check(row):
-    """HTTP 행의 상태 코드와 응답 시간을 잰다. 실패하면 None을 돌려준다."""
-    host = connect_host(row["addr"])
-    try:
-        family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        start = time.monotonic()
-        with socket.socket(family, socket.SOCK_STREAM) as sock:
-            sock.settimeout(HEALTH_TIMEOUT)
-            sock.connect((host, row["port"]))
-            sock.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n"
-                         b"User-Agent: PortWatch\r\nConnection: close\r\n\r\n")
-            head = sock.recv(64)
-        elapsed = int((time.monotonic() - start) * 1000)
-        m = re.match(rb"HTTP/\d\.\d (\d{3})", head)
-        return (int(m.group(1)), elapsed) if m else None
-    except Exception:
-        return None
-
-
-def merge_dual_stack(rows):
-    groups = {}
-    for row in rows:
-        groups.setdefault((row["port"], row["pid"], row["name"]), []).append(row)
-    merged = []
-    for group in groups.values():
-        base = dict(group[0])
-        addrs = sorted({r["addr"] for r in group})
-        wildcard = [a for a in addrs if a in ("0.0.0.0", "::", "*")]
-        base["addr"] = wildcard[0] if wildcard else addrs[0]
-        base["addrs"] = ", ".join(addrs)
-        base["public"] = bool(wildcard) or any(
-            not a.startswith("127.") and a not in ("::1",) for a in addrs)
-        merged.append(base)
-    return sorted(merged, key=lambda r: (r["port"], r["addr"]))
-
-
-DEMO_ROWS = [
-    # (포트, 바인드, 프로세스, 제목, 명령줄, 작업 디렉터리, 종류, docker, 가동시간)
-    (3000, "127.0.0.1", "node", "storefront · Next.js",
-     "node node_modules/.bin/next dev --port 3000", "~/work/storefront", "http", False, "02:41:08"),
-    (5173, "127.0.0.1", "node", "admin-console · Vite",
-     "node node_modules/.bin/vite --host 127.0.0.1 --port 5173", "~/work/admin-console", "http", False, "01:12:55"),
-    (8000, "0.0.0.0", "python3", "billing-api · uvicorn",
-     "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload", "~/work/billing-api", "http", False, "03:27:19"),
-    (6006, "127.0.0.1", "node", "design-system · Storybook",
-     "node node_modules/.bin/storybook dev -p 6006", "~/work/design-system", "http", False, "00:48:02"),
-    (5432, "127.0.0.1", "postgres", "pg-main · Docker",
-     "postgres -c config_file=/etc/postgresql/postgresql.conf", "/var/lib/postgresql", "tcp", True, "11:04:33"),
-    (6379, "0.0.0.0", "redis-server", "cache · Docker",
-     "redis-server *:6379", "/data", "tcp", True, "11:04:33"),
-    (9090, "127.0.0.1", "prometheus", "prometheus · Docker",
-     "/bin/prometheus --config.file=/etc/prometheus/prometheus.yml", "/prometheus", "http", True, "11:04:30"),
-    (22, "0.0.0.0", "sshd", "SSH (추정)", "", "", "tcp", False, ""),
-    (631, "127.0.0.1", "cupsd", "CUPS 인쇄 (추정)", "", "", "http", False, ""),
-]
-
-
-def demo_rows():
-    """README 스크린샷과 UI 점검용 가상 데이터."""
-    rows = []
-    for port, addr, name, title, cmd, cwd, kind, docker, uptime in DEMO_ROWS:
-        row = {
-            "port": port, "addr": addr, "addrs": addr, "name": name, "pid": 1000 + port,
-            "user": "demo", "cmdline": cmd, "cwd": cwd, "docker": docker,
-            "uptime": uptime, "restricted": not cmd, "container": None,
-            "kind": kind, "title": title, "health": (200, 3) if kind == "http" else None,
-            "public": addr in ("0.0.0.0", "::"),
-        }
-        row["section"] = classify(row)
-        rows.append(row)
-    return rows
-
-
-def collect(check_health=False):
-    if os.environ.get("PORTWATCH_DEMO"):
-        return demo_rows()
-    rows = {}
-    for line in sh(["ss", "-ltnpH"]).splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        addr, port = split_addr(parts[3])
-        if not port.isdigit():
-            continue
-        m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
-        name, pid = (m.group(1), int(m.group(2))) if m else ("", 0)
-        key = (addr, int(port))
-        if key in rows and not name:
-            continue
-        rows[key] = {"addr": addr, "port": int(port), "name": name, "pid": pid}
-
-    for row in rows.values():
-        if row["pid"]:
-            row.update(proc_info(row["pid"]))
-            row["container"] = container_of(row["pid"]) if row["docker"] else None
-        else:
-            row.update({"user": "root", "cmdline": "", "cwd": "", "container": None,
-                        "docker": False, "uptime": "", "restricted": True})
-            row.setdefault("name", "")
-        row.setdefault("restricted", False)
-
-    merged = merge_dual_stack(rows.values())
-    for row in merged:
-        row["kind"] = probe(row["addr"], row["port"])
-        row["health"] = (health_check(row)
-                         if check_health and row["kind"] == "http" else None)
-        if row["restricted"]:
-            guess = WELL_KNOWN.get(row["port"])
-            row["title"] = f"{guess} (추정)" if guess else f"포트 {row['port']}"
-        else:
-            row["title"] = friendly_name(row)
-        row["section"] = classify(row)
-    return merged
-
-
-def classify(row):
-    if row["restricted"] or row["name"] in SYSTEM_PROCS or row["port"] in SYSTEM_PORTS:
-        return "system"
-    if row["docker"]:
-        return "docker"
-    return "mine"
-
-
-def url_for(row):
-    scheme = {"http": "http", "https": "https"}.get(row.get("kind", "tcp"), "http")
-    if row["port"] in (443, 8443) and scheme == "http":
-        scheme = "https"
-    host = connect_host(row["addr"])
-    if ":" in host:
-        host = f"[{host}]"
-    return f"{scheme}://{host}:{row['port']}/"
-
-
-# ---------------------------------------------------------------- 설정 저장
 
 def load_config():
-    try:
-        with open(CONFIG, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
+    return config_mod.load()
 
 
 def save_config(cfg):
-    try:
-        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-        with open(CONFIG, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    config_mod.save(cfg)
 
 
 # ---------------------------------------------------------------- 스타일
@@ -864,18 +518,10 @@ class Window(Adw.ApplicationWindow):
         dialog.present()
 
     def restart(self, port, saved):
-        if not os.path.isdir(saved["cwd"]):
-            self.toast("작업 디렉터리가 더 이상 없습니다")
-            return
-        try:
-            subprocess.Popen(shlex.split(saved["cmdline"]), cwd=saved["cwd"],
-                             start_new_session=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as exc:
-            self.toast(f"실행하지 못했습니다 — {exc}")
-            return
-        self.toast(f"{saved['title']} 을(를) 실행했습니다")
-        GLib.timeout_add_seconds(2, self.force_reload)
+        ok, message = actions.restart(saved)
+        self.toast(message)
+        if ok:
+            GLib.timeout_add_seconds(2, self.force_reload)
 
     def forget_command(self, port):
         self.commands.pop(str(port), None)
@@ -969,15 +615,7 @@ class Window(Adw.ApplicationWindow):
         dialog.present()
 
     # ---------- 프로세스 종료
-    @staticmethod
-    def can_kill(row):
-        """내가 소유한, 컨테이너 밖의 프로세스만 종료 대상으로 삼는다.
-
-        컨테이너 안의 프로세스를 직접 죽이면 재시작 정책에 따라 되살아나거나
-        컨테이너가 어중간한 상태로 남는다. 그쪽은 docker stop 으로 안내한다.
-        """
-        return (bool(row["pid"]) and not row["restricted"]
-                and not row["docker"] and row["user"] == CURRENT_USER)
+    can_kill = staticmethod(can_kill)
 
     def row_by_port(self, port):
         for row in self.rows:
@@ -1024,25 +662,21 @@ class Window(Adw.ApplicationWindow):
     def on_kill_response(self, dialog, response, row):
         if response != "kill":
             return
-        self.send_signal(row, signal.SIGTERM, "종료 신호(SIGTERM)를 보냈습니다")
+        self.send_signal(row, "term", "종료 신호를 보냈습니다")
 
     def send_signal(self, row, sig, message):
         pid, title = row["pid"], row["title"]
         if os.environ.get("PORTWATCH_DEMO"):
             self.toast(f"데모 모드입니다 — 실제라면 {title} (PID {pid}) 에 "
-                       f"{sig.name} 을(를) 보냅니다")
+                       f"{'강제 종료' if sig == 'kill' else '종료'} 신호를 보냅니다")
             return
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            self.toast(f"{title} 은(는) 이미 종료된 상태입니다")
+        ok, detail = (actions.force_kill(pid) if sig == "kill" else actions.terminate(pid))
+        if not ok:
+            self.toast(f"{title}: {detail}")
             self.force_reload()
             return
-        except PermissionError:
-            self.toast(f"권한이 없어 {title} 을(를) 종료하지 못했습니다")
-            return
         self.toast(f"{title} 에 {message}")
-        if sig is signal.SIGTERM:
+        if sig == "term":
             GLib.timeout_add_seconds(KILL_GRACE_SEC, self.after_grace, row)
         else:
             GLib.timeout_add_seconds(1, self.force_reload)
@@ -1050,9 +684,7 @@ class Window(Adw.ApplicationWindow):
     def after_grace(self, row):
         """SIGTERM을 보내고 기다린 뒤에도 살아 있으면 강제 종료를 묻는다."""
         pid, title = row["pid"], row["title"]
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if not actions.is_alive(pid):
             self.toast(f"{title} 이(가) 종료되었습니다")
             self.force_reload()
             return False
@@ -1071,7 +703,7 @@ class Window(Adw.ApplicationWindow):
         dialog.connect(
             "response",
             lambda d, r: r == "force" and self.send_signal(
-                row, signal.SIGKILL, "강제 종료 신호(SIGKILL)를 보냈습니다"))
+                row, "kill", "강제 종료 신호를 보냈습니다"))
         dialog.present()
         return False
 
@@ -1084,39 +716,16 @@ class Window(Adw.ApplicationWindow):
     def open_row(self, row):
         # 데모 데이터의 포트는 실제로 존재하지 않으므로 브라우저를 띄우지 않는다.
         if not os.environ.get("PORTWATCH_DEMO"):
-            Gio.AppInfo.launch_default_for_uri(url_for(row), None)
+            actions.open_url(url_for(row))
         self.toast(f"{row['title']} 을(를) 브라우저에서 열었습니다 — {url_for(row)}")
 
-    TERMINALS = [
-        ("gnome-terminal", ["--working-directory"]),
-        ("kgx", ["--working-directory"]),          # GNOME Console
-        ("ptyxis", ["--working-directory"]),
-        ("konsole", ["--workdir"]),
-        ("xfce4-terminal", ["--working-directory"]),
-        ("alacritty", ["--working-directory"]),
-        ("kitty", ["--directory"]),
-        ("x-terminal-emulator", None),             # 작업 디렉터리 인자가 제각각이라 cwd 로만 연다
-    ]
-
     def open_terminal(self, path):
-        if not os.path.isdir(path):
-            self.toast("작업 디렉터리가 더 이상 없습니다")
-            return
-        for name, flags in self.TERMINALS:
-            exe = GLib.find_program_in_path(name)
-            if not exe:
-                continue
-            cmd = [exe] + ([f"{flags[0]}={path}"] if flags else [])
-            try:
-                subprocess.Popen(cmd, cwd=path, start_new_session=True,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return
-            except Exception:
-                continue
-        self.toast("터미널 프로그램을 찾지 못했습니다")
+        if not actions.open_terminal(path):
+            self.toast("터미널을 열지 못했습니다")
 
     def open_path(self, path):
-        Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(path, None), None)
+        if not actions.open_dir(path):
+            self.toast("작업 디렉터리가 더 이상 없습니다")
 
     def copy(self, text, message):
         self.get_clipboard().set(text)
@@ -1186,5 +795,9 @@ class App(Adw.Application):
         win.present()
 
 
+def main():
+    return App().run(None)
+
+
 if __name__ == "__main__":
-    App().run(None)
+    raise SystemExit(main())

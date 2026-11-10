@@ -1,0 +1,5 @@
+#!/bin/sh
+# PortWatch 런처 — make install 이 만들어 둔 파일입니다.
+PYTHONPATH="__LIBDIR__${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m portwatch "$@"
